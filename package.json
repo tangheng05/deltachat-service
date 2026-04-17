@@ -1,0 +1,16 @@
+{
+  "name": "serey-chat-service",
+  "version": "1.0.0",
+  "description": "Delta Chat microservice for Serey Market order chat and community groups",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@deltachat/stdio-rpc-server": "*",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}

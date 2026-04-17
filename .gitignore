@@ -1,0 +1,4 @@
+node_modules/
+dc-data/
+.env
+*.log
