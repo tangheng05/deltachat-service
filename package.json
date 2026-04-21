@@ -1,6 +1,7 @@
 {
   "name": "serey-chat-service",
   "version": "1.0.0",
+  "type": "module",
   "description": "Delta Chat microservice for Serey Market order chat and community groups",
   "main": "index.js",
   "scripts": {

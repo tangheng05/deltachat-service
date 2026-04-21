@@ -1,4 +1,5 @@
 node_modules/
 dc-data/
+dc-accounts/
 .env
 *.log

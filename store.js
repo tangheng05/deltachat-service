@@ -16,9 +16,9 @@
  * }
  */
 
-const fs = require('fs');
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
-class Store {
+export class Store {
   constructor(filePath) {
     this.filePath = filePath;
     this.data = { accounts: {}, orderChats: {}, communityGroups: {} };
@@ -27,26 +27,24 @@ class Store {
 
   _load() {
     try {
-      if (fs.existsSync(this.filePath)) {
-        this.data = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+      if (existsSync(this.filePath)) {
+        this.data = JSON.parse(readFileSync(this.filePath, 'utf8'));
         this.data.accounts ??= {};
         this.data.orderChats ??= {};
         this.data.communityGroups ??= {};
       }
     } catch (e) {
-      console.error('[store] Failed to load store file:', e.message);
+      console.error('[store] Failed to load:', e.message);
     }
   }
 
   _save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 
   // ── Accounts ──────────────────────────────────────────────────────
 
-  getAccount(username) {
-    return this.data.accounts[username] ?? null;
-  }
+  getAccount(username) { return this.data.accounts[username] ?? null; }
 
   setAccount(username, info) {
     this.data.accounts[username] = info;
@@ -55,28 +53,31 @@ class Store {
 
   // ── Order Chats ───────────────────────────────────────────────────
 
-  getOrderChat(orderId) {
-    return this.data.orderChats[String(orderId)] ?? null;
-  }
+  getOrderChat(orderId) { return this.data.orderChats[String(orderId)] ?? null; }
 
   setOrderChat(orderId, info) {
     this.data.orderChats[String(orderId)] = info;
     this._save();
   }
 
-  /** Find the order_id for a given DC chatId (for SSE routing) */
   findOrderIdByChatId(chatId) {
-    for (const [orderId, info] of Object.entries(this.data.orderChats)) {
-      if (info.chatId === chatId) return orderId;
+    for (const [id, info] of Object.entries(this.data.orderChats)) {
+      if (info.chatId === chatId) return id;
     }
     return null;
   }
 
+  // Returns all shop inquiry chats for a given shop_id (synthetic order_ids: "shop_<id>_<buyer>")
+  getShopChats(shopId) {
+    const prefix = `shop_${shopId}_`;
+    return Object.entries(this.data.orderChats)
+      .filter(([id]) => id.startsWith(prefix))
+      .map(([order_id, info]) => ({ order_id, ...info }));
+  }
+
   // ── Community Groups ──────────────────────────────────────────────
 
-  getCommunityGroup(communityId) {
-    return this.data.communityGroups[String(communityId)] ?? null;
-  }
+  getCommunityGroup(communityId) { return this.data.communityGroups[String(communityId)] ?? null; }
 
   setCommunityGroup(communityId, info) {
     this.data.communityGroups[String(communityId)] = info;
@@ -85,11 +86,9 @@ class Store {
 
   addCommunityMember(communityId, username) {
     const group = this.data.communityGroups[String(communityId)];
-    if (!group) return;
-    if (!group.memberUsernames.includes(username)) {
-      group.memberUsernames.push(username);
-      this._save();
-    }
+    if (!group || group.memberUsernames.includes(username)) return;
+    group.memberUsernames.push(username);
+    this._save();
   }
 
   removeCommunityMember(communityId, username) {
@@ -99,13 +98,10 @@ class Store {
     this._save();
   }
 
-  /** Find the community_id for a given DC chatId */
   findCommunityIdByChatId(chatId) {
-    for (const [communityId, info] of Object.entries(this.data.communityGroups)) {
-      if (info.chatId === chatId) return communityId;
+    for (const [id, info] of Object.entries(this.data.communityGroups)) {
+      if (info.chatId === chatId) return id;
     }
     return null;
   }
 }
-
-module.exports = Store;
