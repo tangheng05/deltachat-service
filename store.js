@@ -93,6 +93,22 @@ export class Store {
       .map(([order_id, info]) => ({ order_id, ...info }));
   }
 
+  deleteShopChat(orderId) {
+    delete this.data.orderChats[orderId];
+    this._save();
+  }
+
+  // Returns all shop chats where the given username is the buyer
+  getShopChatsForBuyer(buyerUsername) {
+    return Object.entries(this.data.orderChats)
+      .filter(([id, info]) => id.startsWith('shop_') && info.buyerUsername === buyerUsername)
+      .map(([order_id, info]) => {
+        // Extract shopId from order_id: "shop_<shopId>_<buyer>"
+        const shopId = order_id.replace(/^shop_/, '').replace(new RegExp(`_${buyerUsername}$`), '');
+        return { order_id, shopId, ...info };
+      });
+  }
+
   // ── Community Groups ──────────────────────────────────────────────
 
   getCommunityGroup(communityId) { return this.data.communityGroups[String(communityId)] ?? null; }

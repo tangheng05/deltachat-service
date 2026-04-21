@@ -695,6 +695,31 @@ app.get('/shop-events/:shop_id', (req, res) => {
   req.on('close', () => sseUnregister(chatKey, res));
 });
 
+// ── DELETE /shop-chats/:order_id ──────────────────────────────────────
+app.delete('/shop-chats/:order_id', async (req, res) => {
+  const { order_id } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const chat = store.getOrderChat(order_id);
+  if (!chat) return res.status(404).json({ error: 'Chat not found' });
+  if (chat.buyerUsername !== username && chat.sellerUsername !== username)
+    return res.status(403).json({ error: 'Not a participant' });
+  try {
+    const botId = await ensureBotAccount();
+    await dc.deleteChat(botId, chat.chatId);
+    store.deleteShopChat(order_id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /shop-chats/buyer/:username ───────────────────────────────────
+app.get('/shop-chats/buyer/:username', (req, res) => {
+  const { username } = req.params;
+  res.json({ chats: store.getShopChatsForBuyer(username) });
+});
+
 // ── GET /shop-chats/:shop_id ───────────────────────────────────────────
 app.get('/shop-chats/:shop_id', (req, res) => {
   const { shop_id } = req.params;
@@ -868,6 +893,38 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('[/dm/:key/messages/:id DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /messages/:order_id/:message_id ───────────────────────────
+app.delete('/messages/:order_id/:message_id', async (req, res) => {
+  const order_id    = decodeURIComponent(req.params.order_id);
+  const message_id  = req.params.message_id;
+  const { sender_username } = req.body;
+  if (!sender_username) return res.status(400).json({ error: 'sender_username required' });
+
+  const chat = store.getOrderChat(order_id);
+  if (!chat) {
+    console.error(`[msg delete] order not found: "${order_id}"`);
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+  // Allow if sender is buyer OR seller, case-insensitive
+  const buyer  = (chat.buyerUsername  || '').toLowerCase();
+  const seller = (chat.sellerUsername || '').toLowerCase();
+  const sender = (sender_username     || '').toLowerCase();
+  if (buyer !== sender && seller !== sender)
+    return res.status(403).json({ error: 'Not a participant' });
+
+  try {
+    const botId    = await ensureBotAccount();
+    const msgIdNum = parseInt(message_id, 10);
+    if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
+    await dc.deleteMessages(botId, [msgIdNum]);
+    sseBroadcast(`order:${order_id}`, { type: 'message_deleted', id: msgIdNum });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/messages/:order_id/:id DELETE]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
