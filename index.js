@@ -757,7 +757,8 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
   if (!dm) return res.status(404).json({ error: 'DM not found — call POST /dm first' });
 
   const other = dm.userA === sender_username ? dm.userB : dm.userA;
-  req.blockCheckPairs = [[sender_username, other]];
+  // Check both directions: recipient blocked sender, OR sender blocked recipient
+  req.blockCheckPairs = [[sender_username, other], [other, sender_username]];
   req.chatContext = `dm:${dm_key}`;
   next();
 }, blockCheckMiddleware, rateLimiter, spamFilter, async (req, res) => {
@@ -821,6 +822,76 @@ app.get('/dm/:dm_key/events', (req, res) => {
 
   sseRegister(chatKey, res);
   req.on('close', () => sseUnregister(chatKey, res));
+});
+
+// ── POST /dm/:dm_key/mute ─────────────────────────────────────────────
+app.post('/dm/:dm_key/mute', (req, res) => {
+  const { dm_key } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+  if (dm.userA !== username && dm.userB !== username)
+    return res.status(403).json({ error: 'Not a participant' });
+  store.muteDm(username, dm_key);
+  res.json({ success: true });
+});
+
+// ── DELETE /dm/:dm_key/mute ───────────────────────────────────────────
+app.delete('/dm/:dm_key/mute', (req, res) => {
+  const { dm_key } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+  store.unmuteDm(username, dm_key);
+  res.json({ success: true });
+});
+
+// ── DELETE /dm/:dm_key/messages/:message_id ───────────────────────────
+app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
+  const { dm_key, message_id } = req.params;
+  const { sender_username } = req.body;
+  if (!sender_username) return res.status(400).json({ error: 'sender_username required' });
+
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+  if (dm.userA !== sender_username && dm.userB !== sender_username)
+    return res.status(403).json({ error: 'Not a participant' });
+
+  try {
+    const botId = await ensureBotAccount();
+    const msgIdNum = parseInt(message_id, 10);
+    if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
+    await dc.deleteMessages(botId, [msgIdNum]);
+    sseBroadcast(`dm:${dm_key}`, { type: 'message_deleted', id: msgIdNum });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/dm/:key/messages/:id DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /dm/:dm_key ────────────────────────────────────────────────
+app.delete('/dm/:dm_key', async (req, res) => {
+  const { dm_key } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+  if (dm.userA !== username && dm.userB !== username)
+    return res.status(403).json({ error: 'Not a participant' });
+
+  try {
+    const botId = await ensureBotAccount();
+    await dc.deleteChat(botId, dm.chatId);
+    store.deleteDm(dm_key);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/dm/:key DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── GET /dm/user/:username ────────────────────────────────────────────

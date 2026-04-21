@@ -89,4 +89,13 @@ export class DeltaChatClient extends EventEmitter {
   markSeenMsgs(accountId, msgIds) {
     return this._dc.rpc.markseenMsgs(accountId, msgIds);
   }
+
+  deleteMessages(accountId, msgIds) {
+    // Delta Chat RPC uses deleteMessages (plural)
+    return this._dc.rpc.deleteMessages(accountId, msgIds);
+  }
+
+  deleteChat(accountId, chatId) {
+    return this._dc.rpc.deleteChat(accountId, chatId);
+  }
 }

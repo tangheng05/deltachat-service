@@ -41,9 +41,10 @@ export class Store {
         this.data.orderChats ??= {};
         this.data.communityGroups ??= {};
         this.data.directMessages ??= {};
-        this.data.moderation ??= { blocks: {}, globalMutes: {} };
+        this.data.moderation ??= { blocks: {}, globalMutes: {}, mutedDms: {} };
         this.data.moderation.blocks ??= {};
         this.data.moderation.globalMutes ??= {};
+        this.data.moderation.mutedDms ??= {};
         // Backfill new fields on existing groups
         for (const group of Object.values(this.data.communityGroups)) {
           group.joinMode ??= 'open';
@@ -246,10 +247,42 @@ export class Store {
     return null;
   }
 
+  deleteDm(dmKey) {
+    delete this.data.directMessages[dmKey];
+    // Remove from mute lists too
+    for (const list of Object.values(this.data.moderation.mutedDms ?? {})) {
+      const idx = list.indexOf(dmKey);
+      if (idx !== -1) list.splice(idx, 1);
+    }
+    this._save();
+  }
+
   getDmsForUser(username) {
+    const mutedDms = this.data.moderation.mutedDms[username] ?? [];
     return Object.entries(this.data.directMessages)
       .filter(([, info]) => info.userA === username || info.userB === username)
-      .map(([dmKey, info]) => ({ dmKey, ...info }));
+      .map(([dmKey, info]) => ({ dmKey, ...info, muted: mutedDms.includes(dmKey) }));
+  }
+
+  // ── DM mute ───────────────────────────────────────────────────────
+
+  muteDm(username, dmKey) {
+    this.data.moderation.mutedDms[username] ??= [];
+    if (!this.data.moderation.mutedDms[username].includes(dmKey)) {
+      this.data.moderation.mutedDms[username].push(dmKey);
+      this._save();
+    }
+  }
+
+  unmuteDm(username, dmKey) {
+    const list = this.data.moderation.mutedDms[username];
+    if (!list) return;
+    this.data.moderation.mutedDms[username] = list.filter((k) => k !== dmKey);
+    this._save();
+  }
+
+  isDmMuted(username, dmKey) {
+    return !!(this.data.moderation.mutedDms[username]?.includes(dmKey));
   }
 
   // ── Moderation (block/unblock) ────────────────────────────────────
@@ -271,6 +304,10 @@ export class Store {
 
   isBlocked(sender, recipient) {
     return !!(this.data.moderation.blocks[recipient]?.includes(sender));
+  }
+
+  hasBlocked(blocker, target) {
+    return !!(this.data.moderation.blocks[blocker]?.includes(target));
   }
 
   getBlocks(username) {
