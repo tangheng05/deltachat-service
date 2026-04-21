@@ -3,3 +3,5 @@ dc-data/
 dc-accounts/
 .env
 *.log
+package-lock.json
+.env.example

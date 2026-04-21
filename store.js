@@ -3,15 +3,23 @@
  *
  * Schema:
  * {
- *   accounts: {
- *     "__bot__": { accountId, addr, password },
- *     "username": { accountId, addr, password }
- *   },
- *   orderChats: {
- *     "order_id": { chatId, buyerUsername, sellerUsername, createdAt }
- *   },
+ *   accounts: { "__bot__": { accountId, addr, password }, "<username>": {...} },
+ *   orderChats: { "<order_id>": { chatId, buyerUsername, sellerUsername, createdAt } },
  *   communityGroups: {
- *     "community_id": { chatId, name, memberUsernames: [], createdAt }
+ *     "<community_id>": {
+ *       chatId, name, createdAt, ownerUsername, announcementMode,
+ *       joinMode: "open"|"approval_required",
+ *       memberUsernames: [],
+ *       roles: { "<username>": "owner"|"admin"|"moderator"|"member" },
+ *       mutes: { "<username>": <unix ms expiry, 0 = permanent> },
+ *       bans:  { "<username>": { bannedAt, bannedBy, reason } },
+ *       pendingMembers: { "<username>": { requestedAt } }
+ *     }
+ *   },
+ *   directMessages: { "<userA>:<userB>": { chatId, userA, userB, createdAt } },
+ *   moderation: {
+ *     blocks: { "<username>": ["<blocked_username>", ...] },
+ *     globalMutes: { "<username>": { mutedUntil: <unix ms> } }
  *   }
  * }
  */
@@ -32,6 +40,15 @@ export class Store {
         this.data.accounts ??= {};
         this.data.orderChats ??= {};
         this.data.communityGroups ??= {};
+        this.data.directMessages ??= {};
+        this.data.moderation ??= { blocks: {}, globalMutes: {} };
+        this.data.moderation.blocks ??= {};
+        this.data.moderation.globalMutes ??= {};
+        // Backfill new fields on existing groups
+        for (const group of Object.values(this.data.communityGroups)) {
+          group.joinMode ??= 'open';
+          group.pendingMembers ??= {};
+        }
       }
     } catch (e) {
       console.error('[store] Failed to load:', e.message);
@@ -103,5 +120,160 @@ export class Store {
       if (info.chatId === chatId) return id;
     }
     return null;
+  }
+
+  // ── Group moderation ──────────────────────────────────────────────
+
+  setGroupMember(communityId, username, role) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.roles ??= {};
+    group.roles[username] = role;
+    if (!group.memberUsernames.includes(username)) group.memberUsernames.push(username);
+    this._save();
+  }
+
+  removeGroupMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
+    group.roles ??= {};
+    delete group.roles[username];
+    this._save();
+  }
+
+  muteGroupMember(communityId, username, mutedUntil) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.mutes ??= {};
+    group.mutes[username] = mutedUntil; // 0 = permanent, else unix ms
+    this._save();
+  }
+
+  unmuteGroupMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.mutes ??= {};
+    delete group.mutes[username];
+    this._save();
+  }
+
+  banGroupMember(communityId, username, bannedBy, reason = '') {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.bans ??= {};
+    group.bans[username] = { bannedAt: Date.now(), bannedBy, reason };
+    group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
+    group.roles ??= {};
+    delete group.roles[username];
+    this._save();
+  }
+
+  unbanGroupMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.bans ??= {};
+    delete group.bans[username];
+    this._save();
+  }
+
+  setGroupRole(communityId, username, role) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.roles ??= {};
+    group.roles[username] = role;
+    this._save();
+  }
+
+  setGroupSettings(communityId, settings) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    if (typeof settings.announcementMode === 'boolean') group.announcementMode = settings.announcementMode;
+    if (settings.joinMode === 'open' || settings.joinMode === 'approval_required') group.joinMode = settings.joinMode;
+    this._save();
+  }
+
+  // ── Join requests ─────────────────────────────────────────────────────
+
+  addPendingMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.pendingMembers ??= {};
+    if (!group.pendingMembers[username]) {
+      group.pendingMembers[username] = { requestedAt: Date.now() };
+      this._save();
+    }
+  }
+
+  removePendingMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.pendingMembers ??= {};
+    delete group.pendingMembers[username];
+    this._save();
+  }
+
+  getPendingMembers(communityId) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return [];
+    return Object.entries(group.pendingMembers ?? {}).map(([username, info]) => ({ username, ...info }));
+  }
+
+  approvePendingMember(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.pendingMembers ??= {};
+    delete group.pendingMembers[username];
+    group.roles ??= {};
+    group.roles[username] = 'member';
+    if (!group.memberUsernames.includes(username)) group.memberUsernames.push(username);
+    this._save();
+  }
+
+  // ── Direct Messages ───────────────────────────────────────────────
+
+  getDm(dmKey) { return this.data.directMessages[dmKey] ?? null; }
+
+  setDm(dmKey, info) {
+    this.data.directMessages[dmKey] = info;
+    this._save();
+  }
+
+  findDmKeyByChatId(chatId) {
+    for (const [key, info] of Object.entries(this.data.directMessages)) {
+      if (info.chatId === chatId) return key;
+    }
+    return null;
+  }
+
+  getDmsForUser(username) {
+    return Object.entries(this.data.directMessages)
+      .filter(([, info]) => info.userA === username || info.userB === username)
+      .map(([dmKey, info]) => ({ dmKey, ...info }));
+  }
+
+  // ── Moderation (block/unblock) ────────────────────────────────────
+
+  addBlock(blocker, target) {
+    this.data.moderation.blocks[blocker] ??= [];
+    if (!this.data.moderation.blocks[blocker].includes(target)) {
+      this.data.moderation.blocks[blocker].push(target);
+      this._save();
+    }
+  }
+
+  removeBlock(blocker, target) {
+    const list = this.data.moderation.blocks[blocker];
+    if (!list) return;
+    this.data.moderation.blocks[blocker] = list.filter((u) => u !== target);
+    this._save();
+  }
+
+  isBlocked(sender, recipient) {
+    return !!(this.data.moderation.blocks[recipient]?.includes(sender));
+  }
+
+  getBlocks(username) {
+    return this.data.moderation.blocks[username] ?? [];
   }
 }
