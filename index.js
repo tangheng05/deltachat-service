@@ -313,6 +313,7 @@ app.post('/groups', async (req, res) => {
         ownerUsername: owner_username || null,
         announcementMode: false,
         joinMode: 'open',
+        enabled: false,
         roles: owner_username ? { [owner_username]: 'owner' } : {},
         mutes: {},
         bans: {},
@@ -339,6 +340,7 @@ app.get('/groups/:community_id', (req, res) => {
     name: group.name,
     announcementMode: group.announcementMode ?? false,
     joinMode: group.joinMode ?? 'open',
+    enabled: group.enabled ?? true,
     memberCount: group.memberUsernames.length,
     pendingCount: Object.keys(group.pendingMembers ?? {}).length,
   });
@@ -408,7 +410,9 @@ app.get('/groups/:community_id/messages', async (req, res) => {
 // ── GET /groups/:community_id/events ──────────────────────────────────
 app.get('/groups/:community_id/events', (req, res) => {
   const { community_id } = req.params;
-  const chatKey = `community:${community_id}`;
+  const { username } = req.query;
+  const broadcastKey = `community:${community_id}`;
+  const userKey = username ? `community:${community_id}:${username}` : null;
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -416,22 +420,30 @@ app.get('/groups/:community_id/events', (req, res) => {
   res.flushHeaders();
   res.write('data: {"type":"connected"}\n\n');
 
-  sseRegister(chatKey, res);
-  req.on('close', () => sseUnregister(chatKey, res));
+  sseRegister(broadcastKey, res);
+  if (userKey) sseRegister(userKey, res);
+
+  req.on('close', () => {
+    sseUnregister(broadcastKey, res);
+    if (userKey) sseUnregister(userKey, res);
+  });
 });
 
 // ── GET /groups ───────────────────────────────────────────────────────
 app.get('/groups', (req, res) => {
   const { username } = req.query;
-  const groups = Object.entries(store.data.communityGroups).map(([id, info]) => ({
-    community_id: id,
-    chatId: info.chatId,
-    name: info.name,
-    memberCount: info.memberUsernames.length,
-    createdAt: info.createdAt,
-    announcementMode: info.announcementMode ?? false,
-    role: username ? ((info.roles ?? {})[username] ?? null) : undefined,
-  }));
+  const groups = Object.entries(store.data.communityGroups)
+    .filter(([, info]) => info.enabled !== false) // hide disabled groups from subscribers
+    .map(([id, info]) => ({
+      community_id: id,
+      chatId: info.chatId,
+      name: info.name,
+      memberCount: info.memberUsernames.length,
+      createdAt: info.createdAt,
+      announcementMode: info.announcementMode ?? false,
+      enabled: info.enabled ?? true,
+      role: username ? ((info.roles ?? {})[username] ?? null) : undefined,
+    }));
   res.json({ groups });
 });
 
@@ -444,10 +456,20 @@ app.post('/groups/:community_id/join', (req, res) => {
   const group = store.getCommunityGroup(community_id);
   if (!group) return res.status(404).json({ error: 'Group not found' });
 
-  if ((group.bans ?? {})[username]) return res.status(403).json({ error: 'You are banned from this group' });
+  if ((group.bans ?? {})[username]) return res.status(403).json({ error: 'You are banned from this group', reason: 'banned' });
+
+  // Kicked users cannot auto-rejoin — they must use the explicit rejoin endpoint
+  if ((group.kicks ?? {})[username]) return res.status(403).json({ error: 'You have been removed from this group', reason: 'kicked' });
 
   // Already a member — idempotent
   if (group.memberUsernames.includes(username)) return res.json({ success: true, status: 'already_member' });
+
+  // Users who voluntarily left bypass approval — they were already trusted members
+  if ((group.leftVoluntarily ?? {})[username]) {
+    store.clearLeftVoluntarily(community_id, username);
+    store.setGroupMember(community_id, username, 'member');
+    return res.json({ success: true, status: 'joined' });
+  }
 
   if ((group.joinMode ?? 'open') === 'approval_required') {
     // Owner and admins can join directly even in approval mode
@@ -458,6 +480,36 @@ app.post('/groups/:community_id/join', (req, res) => {
     }
     store.addPendingMember(community_id, username);
     return res.status(202).json({ success: true, status: 'pending', message: 'Join request submitted. Awaiting approval.' });
+  }
+
+  store.setGroupMember(community_id, username, 'member');
+  res.json({ success: true, status: 'joined' });
+});
+
+// ── POST /groups/:community_id/rejoin ─────────────────────────────────
+// Explicitly re-request entry after being kicked. Clears the kick record,
+// then goes through the normal join flow (open → instant; approval → pending).
+app.post('/groups/:community_id/rejoin', (req, res) => {
+  const { community_id } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if ((group.bans ?? {})[username]) return res.status(403).json({ error: 'You are banned from this group', reason: 'banned' });
+
+  // Clear the kick so the normal join can proceed
+  store.clearKick(community_id, username);
+
+  if ((group.joinMode ?? 'open') === 'approval_required') {
+    const role = (group.roles ?? {})[username];
+    if (role === 'owner' || role === 'admin') {
+      store.setGroupMember(community_id, username, role);
+      return res.json({ success: true, status: 'joined' });
+    }
+    store.addPendingMember(community_id, username);
+    return res.status(202).json({ success: true, status: 'pending', message: 'Rejoin request submitted. Awaiting approval.' });
   }
 
   store.setGroupMember(community_id, username, 'member');
@@ -477,6 +529,7 @@ app.post('/groups/:community_id/leave', (req, res) => {
   if (roles[username] === 'owner') return res.status(400).json({ error: 'Owner must transfer ownership before leaving' });
 
   store.removeGroupMember(community_id, username);
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'left' });
   res.json({ success: true });
 });
 
@@ -519,19 +572,23 @@ app.get('/groups/:community_id/members', (req, res) => {
     isBanned: true,
   }));
 
-  res.json({ members, bannedUsers });
+  const pendingUsernames = Object.keys(group.pendingMembers ?? {});
+  res.json({ members, bannedUsers, pendingUsernames });
 });
 
 // ── DELETE /groups/:community_id/members/:username ────────────────────
 app.delete('/groups/:community_id/members/:username', (req, res, next) => requireRole(store, 'moderator', req, res, next), (req, res) => {
   const { community_id, username } = req.params;
+  const { actor_username } = req.body;
   const group = store.getCommunityGroup(community_id);
   if (!group) return res.status(404).json({ error: 'Group not found' });
 
   const roles = group.roles ?? {};
   if (roles[username] === 'owner') return res.status(403).json({ error: 'Cannot kick the owner' });
 
-  store.removeGroupMember(community_id, username);
+  store.kickGroupMember(community_id, username, actor_username || 'unknown');
+  // Push real-time event to the kicked user's SSE stream
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'kicked' });
   res.json({ success: true });
 });
 
@@ -570,6 +627,8 @@ app.post('/groups/:community_id/members/:username/ban', (req, res, next) => requ
   if (roles[username] === 'owner') return res.status(403).json({ error: 'Cannot ban the owner' });
 
   store.banGroupMember(community_id, username, actor_username, reason);
+  // Push real-time event to the banned user's SSE stream
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'banned' });
   res.json({ success: true });
 });
 
@@ -580,6 +639,8 @@ app.delete('/groups/:community_id/members/:username/ban', (req, res, next) => re
   if (!group) return res.status(404).json({ error: 'Group not found' });
 
   store.unbanGroupMember(community_id, username);
+  // Notify the unbanned user so their UI can update
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'unbanned' });
   res.json({ success: true });
 });
 
@@ -602,6 +663,8 @@ app.post('/groups/:community_id/members/:username/role', (req, res, next) => req
   if (role === 'admin' && actorRole !== 'owner') return res.status(403).json({ error: 'Only the owner can promote to admin' });
 
   store.setGroupRole(community_id, username, role);
+  // Notify the affected user so their UI updates in real-time
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'role_changed', role });
   res.json({ success: true });
 });
 
@@ -641,6 +704,34 @@ app.put('/groups/:community_id/settings', (req, res, next) => requireRole(store,
   res.json({ success: true, settings: { announcementMode: announcement_mode, joinMode: join_mode } });
 });
 
+// ── PATCH /groups/:community_id — rename (owner only) ────────────────
+app.patch('/groups/:community_id', (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username, name } = req.body;
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if ((group.roles ?? {})[actor_username] !== 'owner')
+    return res.status(403).json({ error: 'Only the owner can rename the group' });
+  if (!name || typeof name !== 'string' || !name.trim())
+    return res.status(400).json({ error: 'name is required' });
+  store.renameGroup(community_id, name.trim());
+  res.json({ success: true, name: name.trim() });
+});
+
+// ── PATCH /groups/:community_id/enabled — enable/disable (owner only) ────────
+app.patch('/groups/:community_id/enabled', (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username, enabled } = req.body;
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if ((group.roles ?? {})[actor_username] !== 'owner')
+    return res.status(403).json({ error: 'Only the owner can enable/disable the group chat' });
+  if (typeof enabled !== 'boolean')
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  store.setGroupEnabled(community_id, enabled);
+  res.json({ success: true, enabled });
+});
+
 // ── GET /groups/:community_id/join-requests ───────────────────────────
 app.get('/groups/:community_id/join-requests', (req, res, next) => {
   // Inline admin check — requireRole reads actor_username from body, but this is GET
@@ -669,6 +760,8 @@ app.post('/groups/:community_id/join-requests/:username/approve', (req, res, nex
   if ((group.bans ?? {})[username]) return res.status(403).json({ error: 'User is banned' });
 
   store.approvePendingMember(community_id, username);
+  // Push real-time event to the approved user's SSE stream
+  sseBroadcast(`community:${community_id}:${username}`, { type: 'approved' });
   res.json({ success: true });
 });
 

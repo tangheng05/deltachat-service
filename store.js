@@ -49,6 +49,7 @@ export class Store {
         for (const group of Object.values(this.data.communityGroups)) {
           group.joinMode ??= 'open';
           group.pendingMembers ??= {};
+          group.enabled ??= true; // existing groups stay enabled
         }
       }
     } catch (e) {
@@ -156,6 +157,15 @@ export class Store {
     group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
     group.roles ??= {};
     delete group.roles[username];
+    group.leftVoluntarily ??= {};
+    group.leftVoluntarily[username] = true;
+    this._save();
+  }
+
+  clearLeftVoluntarily(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group?.leftVoluntarily) return;
+    delete group.leftVoluntarily[username];
     this._save();
   }
 
@@ -175,11 +185,33 @@ export class Store {
     this._save();
   }
 
+  kickGroupMember(communityId, username, kickedBy) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.kicks ??= {};
+    group.kicks[username] = { kickedAt: Date.now(), kickedBy };
+    group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
+    group.roles ??= {};
+    delete group.roles[username];
+    this._save();
+  }
+
+  clearKick(communityId, username) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.kicks ??= {};
+    delete group.kicks[username];
+    this._save();
+  }
+
   banGroupMember(communityId, username, bannedBy, reason = '') {
     const group = this.data.communityGroups[String(communityId)];
     if (!group) return;
     group.bans ??= {};
     group.bans[username] = { bannedAt: Date.now(), bannedBy, reason };
+    // Also clear any pending kick so ban takes full precedence
+    group.kicks ??= {};
+    delete group.kicks[username];
     group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
     group.roles ??= {};
     delete group.roles[username];
@@ -207,6 +239,20 @@ export class Store {
     if (!group) return;
     if (typeof settings.announcementMode === 'boolean') group.announcementMode = settings.announcementMode;
     if (settings.joinMode === 'open' || settings.joinMode === 'approval_required') group.joinMode = settings.joinMode;
+    this._save();
+  }
+
+  renameGroup(communityId, name) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group || !name) return;
+    group.name = name;
+    this._save();
+  }
+
+  setGroupEnabled(communityId, enabled) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.enabled = Boolean(enabled);
     this._save();
   }
 
