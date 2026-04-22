@@ -157,6 +157,8 @@ export class Store {
     group.memberUsernames = group.memberUsernames.filter((u) => u !== username);
     group.roles ??= {};
     delete group.roles[username];
+    group.pendingMembers ??= {};
+    delete group.pendingMembers[username];
     group.leftVoluntarily ??= {};
     group.leftVoluntarily[username] = true;
     this._save();

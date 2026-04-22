@@ -407,6 +407,63 @@ app.get('/groups/:community_id/messages', async (req, res) => {
   }
 });
 
+// ── DELETE /groups/:community_id/messages/:msg_id ─────────────────────
+// Own messages: any member. Others' messages: moderator+.
+app.delete('/groups/:community_id/messages/:msg_id', async (req, res) => {
+  const { community_id, msg_id } = req.params;
+  const { actor_username } = req.body;
+  if (!actor_username) return res.status(400).json({ error: 'actor_username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  const ROLE_RANK = { owner: 4, admin: 3, moderator: 2, member: 1 };
+  const actorRank = ROLE_RANK[(group.roles ?? {})[actor_username]] ?? 1;
+
+  try {
+    const botId = await ensureBotAccount();
+    const msg = await dc.getMessage(botId, Number(msg_id)).catch(() => null);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    // Extract sender from the formatted text "💬 (username): ..."
+    const senderMatch = msg.text?.match(/^💬 \(([^)]+)\):/);
+    const sender = senderMatch?.[1];
+
+    const isOwn = sender === actor_username;
+    const canModerate = actorRank >= ROLE_RANK.moderator;
+    if (!isOwn && !canModerate) return res.status(403).json({ error: 'Not allowed' });
+
+    await dc.deleteMessages(botId, [Number(msg_id)]);
+    sseBroadcast(`community:${community_id}`, { type: 'message_deleted', id: Number(msg_id) });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /groups/:community_id/messages — clear all (owner only) ────
+app.delete('/groups/:community_id/messages', async (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username } = req.body;
+  if (!actor_username) return res.status(400).json({ error: 'actor_username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if ((group.roles ?? {})[actor_username] !== 'owner')
+    return res.status(403).json({ error: 'Only the owner can clear all messages' });
+
+  try {
+    const botId = await ensureBotAccount();
+    const msgIds = await dc.getMessageIds(botId, group.chatId);
+    if (msgIds.length) await dc.deleteMessages(botId, msgIds);
+    sseBroadcast(`community:${community_id}`, { type: 'messages_cleared' });
+    res.json({ success: true, deleted: msgIds.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /groups/:community_id/events ──────────────────────────────────
 app.get('/groups/:community_id/events', (req, res) => {
   const { community_id } = req.params;
@@ -436,13 +493,15 @@ app.get('/groups', (req, res) => {
     .filter(([, info]) => info.enabled !== false) // hide disabled groups from subscribers
     .map(([id, info]) => ({
       community_id: id,
-      chatId: info.chatId,
       name: info.name,
       memberCount: info.memberUsernames.length,
       createdAt: info.createdAt,
       announcementMode: info.announcementMode ?? false,
+      joinMode: info.joinMode ?? 'open',
       enabled: info.enabled ?? true,
       role: username ? ((info.roles ?? {})[username] ?? null) : undefined,
+      isMember: username ? info.memberUsernames.includes(username) : false,
+      isPending: username ? !!(info.pendingMembers ?? {})[username] : false,
     }));
   res.json({ groups });
 });
