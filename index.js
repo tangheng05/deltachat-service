@@ -530,13 +530,14 @@ app.post('/groups/:community_id/join', (req, res) => {
     return res.json({ success: true, status: 'joined' });
   }
 
+  // Always preserve existing elevated role (owner/admin) regardless of join mode
+  const existingRole = (group.roles ?? {})[username];
+  if (existingRole === 'owner' || existingRole === 'admin') {
+    store.setGroupMember(community_id, username, existingRole);
+    return res.json({ success: true, status: 'joined' });
+  }
+
   if ((group.joinMode ?? 'open') === 'approval_required') {
-    // Owner and admins can join directly even in approval mode
-    const role = (group.roles ?? {})[username];
-    if (role === 'owner' || role === 'admin') {
-      store.setGroupMember(community_id, username, role);
-      return res.json({ success: true, status: 'joined' });
-    }
     store.addPendingMember(community_id, username);
     return res.status(202).json({ success: true, status: 'pending', message: 'Join request submitted. Awaiting approval.' });
   }
@@ -737,9 +738,17 @@ app.post('/groups/:community_id/transfer-ownership', (req, res) => {
   if (!group) return res.status(404).json({ error: 'Group not found' });
 
   const roles = group.roles ?? {};
-  if (roles[actor_username] !== 'owner') return res.status(403).json({ error: 'Only the owner can transfer ownership' });
+  const hasOwner = Object.values(roles).includes('owner');
+  // Allow any admin to claim ownership if the group has no owner (recovery path)
+  if (roles[actor_username] !== 'owner') {
+    if (!hasOwner && (roles[actor_username] === 'admin' || roles[actor_username] === 'moderator')) {
+      // Recovery: no owner exists, allow admin/moderator to assign one
+    } else {
+      return res.status(403).json({ error: 'Only the owner can transfer ownership' });
+    }
+  }
 
-  store.setGroupRole(community_id, actor_username, 'admin');
+  if (roles[actor_username] === 'owner') store.setGroupRole(community_id, actor_username, 'admin');
   store.setGroupRole(community_id, new_owner_username, 'owner');
   res.json({ success: true });
 });
