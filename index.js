@@ -32,29 +32,35 @@ const blockCheckMiddleware = blockCheck(store);
 
 // ── Bot account ─────────────────────────────────────────────────────
 let botAccountId = null;
+let _botProvisionPromise = null;
 
 async function ensureBotAccount() {
   if (botAccountId) return botAccountId;
+  if (_botProvisionPromise) return _botProvisionPromise;
 
-  const cached = store.getAccount('__bot__');
-  if (cached) {
-    botAccountId = cached.accountId;
-    await dc.rpc.startIo(botAccountId);
+  _botProvisionPromise = (async () => {
+    const cached = store.getAccount('__bot__');
+    if (cached) {
+      botAccountId = cached.accountId;
+      await dc.rpc.startIo(botAccountId);
+      return botAccountId;
+    }
+
+    console.log(`[bot] Provisioning system bot via ${CHATMAIL_DOMAIN}...`);
+    const accountId = await dc.addAccount();
+    await dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`);
+    await dc.setConfig(accountId, 'displayname', 'Serey System');
+    await dc.configure(accountId);
+
+    const addr = await dc.getConfig(accountId, 'addr');
+    const password = await dc.getConfig(accountId, 'mail_pw');
+    store.setAccount('__bot__', { accountId, addr, password });
+    botAccountId = accountId;
+    console.log(`[bot] Bot ready — accountId=${accountId}, addr=${addr}`);
     return botAccountId;
-  }
+  })();
 
-  console.log(`[bot] Provisioning system bot via ${CHATMAIL_DOMAIN}...`);
-  const accountId = await dc.addAccount();
-  await dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`);
-  await dc.setConfig(accountId, 'displayname', 'Serey System');
-  await dc.configure(accountId);
-
-  const addr = await dc.getConfig(accountId, 'addr');
-  const password = await dc.getConfig(accountId, 'mail_pw');
-  store.setAccount('__bot__', { accountId, addr, password });
-  botAccountId = accountId;
-  console.log(`[bot] Bot ready — accountId=${accountId}, addr=${addr}`);
-  return botAccountId;
+  return _botProvisionPromise;
 }
 
 // ── SSE registry ────────────────────────────────────────────────────
@@ -77,8 +83,8 @@ function sseBroadcast(chatKey, payload) {
   const clients = sseClients.get(chatKey);
   if (!clients || clients.size === 0) return;
   const data = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) {
-    try { res.write(data); } catch { /* disconnected */ }
+  for (const res of [...clients]) {
+    try { res.write(data); } catch { sseUnregister(chatKey, res); }
   }
 }
 
@@ -366,20 +372,22 @@ app.post('/groups/:community_id/send',
       if (!group) return res.status(404).json({ error: 'Group not found — call POST /groups first' });
 
       const botId = await ensureBotAccount();
-      const msgId = await dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`);
+      const localId = Date.now();
 
       sseBroadcast(`community:${community_id}`, {
-        id: msgId,
+        id: localId,
         text,
         senderUsername: sender_username,
         isSystem: false,
-        timestamp: Math.floor(Date.now() / 1000),
+        timestamp: Math.floor(localId / 1000),
       });
+      res.json({ msgId: localId });
 
-      res.json({ msgId });
+      dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`)
+        .catch(e => console.error('[/groups/:id/send] DC error:', e.message));
     } catch (e) {
       console.error('[/groups/:id/send]', e.message);
-      res.status(500).json({ error: e.message });
+      if (!res.headersSent) res.status(500).json({ error: e.message });
     }
   }
 );
@@ -958,20 +966,22 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       return res.status(403).json({ error: 'Not a participant in this DM' });
 
     const botId = await ensureBotAccount();
-    const msgId = await dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`);
+    const localId = Date.now();
 
     sseBroadcast(`dm:${dm_key}`, {
-      id: msgId,
+      id: localId,
       text,
       senderUsername: sender_username,
       isSystem: false,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Math.floor(localId / 1000),
     });
+    res.json({ msgId: localId });
 
-    res.json({ msgId });
+    dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`)
+      .catch(e => console.error('[/dm/:key/send] DC error:', e.message));
   } catch (e) {
     console.error('[/dm/:key/send]', e.message);
-    res.status(500).json({ error: e.message });
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
@@ -1119,7 +1129,7 @@ app.get('/dm/user/:username', (req, res) => {
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────────────
-function shutdown() { try { dc.close(); } catch {} }
+function shutdown() { try { store.flush(); } catch {} try { dc.close(); } catch {} }
 process.on('exit', shutdown);
 process.on('SIGINT', () => { shutdown(); process.exit(0); });
 process.on('SIGTERM', () => { shutdown(); process.exit(0); });

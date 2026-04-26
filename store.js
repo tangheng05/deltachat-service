@@ -24,7 +24,7 @@
  * }
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, writeFile, rename } from 'node:fs';
 
 export class Store {
   constructor(filePath) {
@@ -58,7 +58,23 @@ export class Store {
   }
 
   _save() {
-    writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => {
+      const tmp = this.filePath + '.tmp';
+      const data = JSON.stringify(this.data, null, 2);
+      writeFile(tmp, data, (err) => {
+        if (!err) rename(tmp, this.filePath, () => {});
+      });
+    }, 100);
+  }
+
+  flush() {
+    if (!this._saveTimer) return;
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+    const tmp = this.filePath + '.tmp';
+    writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+    renameSync(tmp, this.filePath);
   }
 
   // ── Accounts ──────────────────────────────────────────────────────
