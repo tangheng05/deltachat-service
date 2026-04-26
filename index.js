@@ -384,6 +384,9 @@ app.post('/groups/:community_id/send',
       res.json({ msgId: localId });
 
       dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`)
+        .then((realMsgId) => {
+          sseBroadcast(`community:${community_id}`, { type: 'message_id_updated', localId, realId: realMsgId });
+        })
         .catch(e => console.error('[/groups/:id/send] DC error:', e.message));
     } catch (e) {
       console.error('[/groups/:id/send]', e.message);
@@ -978,6 +981,9 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     res.json({ msgId: localId });
 
     dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`)
+      .then((realMsgId) => {
+        sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId: realMsgId });
+      })
       .catch(e => console.error('[/dm/:key/send] DC error:', e.message));
   } catch (e) {
     console.error('[/dm/:key/send]', e.message);
