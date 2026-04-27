@@ -95,6 +95,14 @@ export class Store {
     this._save();
   }
 
+  setOrderChatLastSeen(orderId, username, unixSeconds) {
+    const chat = this.data.orderChats[String(orderId)];
+    if (!chat) return;
+    chat.lastSeenBy ??= {};
+    chat.lastSeenBy[username] = unixSeconds;
+    this._save();
+  }
+
   findOrderIdByChatId(chatId) {
     for (const [id, info] of Object.entries(this.data.orderChats)) {
       if (info.chatId === chatId) return id;
@@ -139,6 +147,14 @@ export class Store {
     const group = this.data.communityGroups[String(communityId)];
     if (!group) return;
     group.lastMessage = { text, senderUsername, timestamp };
+    this._save();
+  }
+
+  setGroupLastSeen(communityId, username, unixSeconds) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.lastSeenBy ??= {};
+    group.lastSeenBy[username] = unixSeconds;
     this._save();
   }
 

@@ -30,6 +30,30 @@ const rateLimitMap = new Map();
 const rateLimiter = createRateLimiter(rateLimitMap);
 const blockCheckMiddleware = blockCheck(store);
 
+// ── Timeout helper ───────────────────────────────────────────────────
+function withTimeout(promise, ms, label = 'DC operation') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+// Limit concurrency for bulk DC calls (getMessage × N)
+async function mapConcurrent(items, fn, concurrency = 8) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      results[i] = await fn(items[i]).catch(() => null);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
 // ── Bot account ─────────────────────────────────────────────────────
 let botAccountId = null;
 let _botProvisionPromise = null;
@@ -39,25 +63,32 @@ async function ensureBotAccount() {
   if (_botProvisionPromise) return _botProvisionPromise;
 
   _botProvisionPromise = (async () => {
-    const cached = store.getAccount('__bot__');
-    if (cached) {
-      botAccountId = cached.accountId;
-      await dc.rpc.startIo(botAccountId);
+    try {
+      const cached = store.getAccount('__bot__');
+      if (cached) {
+        botAccountId = cached.accountId;
+        await withTimeout(dc.rpc.startIo(botAccountId), 15_000, 'startIo');
+        return botAccountId;
+      }
+
+      console.log(`[bot] Provisioning system bot via ${CHATMAIL_DOMAIN}...`);
+      const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
+      await withTimeout(dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`), 20_000, 'setConfigFromQr');
+      await dc.setConfig(accountId, 'displayname', 'Serey System');
+      await withTimeout(dc.configure(accountId), 30_000, 'configure');
+
+      const addr = await dc.getConfig(accountId, 'addr');
+      const password = await dc.getConfig(accountId, 'mail_pw');
+      store.setAccount('__bot__', { accountId, addr, password });
+      botAccountId = accountId;
+      console.log(`[bot] Bot ready — accountId=${accountId}, addr=${addr}`);
       return botAccountId;
+    } catch (e) {
+      // Reset so the next request retries instead of re-awaiting the same failure
+      _botProvisionPromise = null;
+      botAccountId = null;
+      throw e;
     }
-
-    console.log(`[bot] Provisioning system bot via ${CHATMAIL_DOMAIN}...`);
-    const accountId = await dc.addAccount();
-    await dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`);
-    await dc.setConfig(accountId, 'displayname', 'Serey System');
-    await dc.configure(accountId);
-
-    const addr = await dc.getConfig(accountId, 'addr');
-    const password = await dc.getConfig(accountId, 'mail_pw');
-    store.setAccount('__bot__', { accountId, addr, password });
-    botAccountId = accountId;
-    console.log(`[bot] Bot ready — accountId=${accountId}, addr=${addr}`);
-    return botAccountId;
   })();
 
   return _botProvisionPromise;
@@ -139,6 +170,20 @@ const rand = (bytes) => randomBytes(bytes).toString('hex');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Timeout middleware — SSE endpoints are excluded (they stay open intentionally)
+app.use((req, res, next) => {
+  if (req.path.endsWith('/events') || req.path.includes('/shop-events/')) return next();
+  const timer = setTimeout(() => {
+    if (!res.headersSent) res.status(503).json({ error: 'Request timed out' });
+  }, 20_000);
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+  // Suppress "headers already sent" errors if the handler responds after timeout
+  const origJson = res.json.bind(res);
+  res.json = (...args) => { if (res.headersSent) return res; return origJson(...args); };
+  next();
+});
 
 // ── GET /health ───────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', domain: CHATMAIL_DOMAIN }));
@@ -278,14 +323,28 @@ app.get('/messages', async (req, res) => {
     const botId = await ensureBotAccount();
     const msgIds = await dc.getMessageIds(botId, chat.chatId);
     const messages = (
-      await Promise.all(msgIds.map((id) => dc.getMessage(botId, id).catch(() => null)))
+      await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id))
     ).filter(Boolean).map(formatMessage);
 
-    res.json({ messages });
+    res.json({ messages, lastSeenBy: chat.lastSeenBy || {} });
   } catch (e) {
     console.error('[/messages]', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── POST /order-seen ─────────────────────────────────────────────────
+app.post('/order-seen', (req, res) => {
+  const { order_id, username } = req.body;
+  if (!order_id || !username) return res.status(400).json({ error: 'order_id and username required' });
+  const chat = store.getOrderChat(order_id);
+  if (!chat) return res.status(404).json({ error: 'Chat not found' });
+  if (chat.buyerUsername !== username && chat.sellerUsername !== username)
+    return res.status(403).json({ error: 'Not a participant' });
+  const nowSec = Math.floor(Date.now() / 1000);
+  store.setOrderChatLastSeen(order_id, username, nowSec);
+  sseBroadcast(`order:${order_id}`, { type: 'seen', username, seenAt: nowSec });
+  res.json({ ok: true });
 });
 
 // ── GET /events ───────────────────────────────────────────────────────
@@ -355,6 +414,7 @@ app.get('/groups/:community_id', (req, res) => {
     enabled: group.enabled ?? true,
     memberCount: group.memberUsernames.length,
     pendingCount: Object.keys(group.pendingMembers ?? {}).length,
+    lastSeenBy: group.lastSeenBy || {},
   });
 });
 
@@ -416,7 +476,7 @@ app.get('/groups/:community_id/messages', async (req, res) => {
     const msgIds = await dc.getMessageIds(botId, group.chatId);
     const recent = msgIds.slice(-limit);
     const messages = (
-      await Promise.all(recent.map((id) => dc.getMessage(botId, id).catch(() => null)))
+      await mapConcurrent(recent, (id) => dc.getMessage(botId, id))
     ).filter(Boolean).map(formatMessage);
 
     if (!group.lastMessage) {
@@ -1017,7 +1077,7 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     const botId = await ensureBotAccount();
     const msgIds = await dc.getMessageIds(botId, dm.chatId);
     const messages = (
-      await Promise.all(msgIds.map((id) => dc.getMessage(botId, id).catch(() => null)))
+      await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id))
     ).filter(Boolean).map(formatMessage);
 
     if (!dm.lastMessage) {
@@ -1025,7 +1085,7 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
       if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
     }
 
-    res.json({ messages });
+    res.json({ messages, lastSeenBy: dm.lastSeenBy || {} });
   } catch (e) {
     console.error('[/dm/:key/messages]', e.message);
     res.status(500).json({ error: e.message });
@@ -1080,7 +1140,23 @@ app.post('/dm/:dm_key/seen', (req, res) => {
   if (!dm) return res.status(404).json({ error: 'DM not found' });
   if (dm.userA !== username && dm.userB !== username)
     return res.status(403).json({ error: 'Not a participant' });
-  store.setDmLastSeen(dm_key, username, Math.floor(Date.now() / 1000));
+  const nowSec = Math.floor(Date.now() / 1000);
+  store.setDmLastSeen(dm_key, username, nowSec);
+  sseBroadcast(`dm:${dm_key}`, { type: 'seen', username, seenAt: nowSec });
+  res.json({ ok: true });
+});
+
+// ── POST /groups/:community_id/seen ──────────────────────────────────
+app.post('/groups/:community_id/seen', (req, res) => {
+  const { community_id } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if (!group.memberUsernames.includes(username)) return res.status(403).json({ error: 'Not a member' });
+  const nowSec = Math.floor(Date.now() / 1000);
+  store.setGroupLastSeen(community_id, username, nowSec);
+  sseBroadcast(`community:${community_id}`, { type: 'seen', username, seenAt: nowSec });
   res.json({ ok: true });
 });
 
