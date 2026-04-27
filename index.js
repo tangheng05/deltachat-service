@@ -151,9 +151,23 @@ dc.on('IncomingMsg', async (contextId, event) => {
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────
+const MSG_RE = /^(?:🛒 Buyer|🏪 Seller|💬 DM|💬)\s+\(([\w.-]+)\):\s*([\s\S]*)$/;
+
 function formatMessage(msg) {
   const raw = msg.text || '';
-  const m = raw.match(/^(?:🛒 Buyer|🏪 Seller|💬 DM|💬)\s+\(([\w.-]+)\):\s*([\s\S]*)$/);
+  const m = raw.match(MSG_RE);
+
+  let replyTo = null;
+  if (msg.quote?.text) {
+    const qt = msg.quote.text;
+    const qm = qt.match(MSG_RE);
+    replyTo = {
+      id: msg.quote.msgId || null,
+      text: (qm ? qm[2] : qt).substring(0, 200),
+      senderUsername: qm ? qm[1] : (msg.quote.authorDisplayName || null),
+    };
+  }
+
   return {
     id: msg.id,
     text: m ? m[2] : raw,
@@ -161,6 +175,7 @@ function formatMessage(msg) {
     isSystem: !m,
     timestamp: msg.timestamp,
     chatId: msg.chatId,
+    replyTo,
   };
 }
 
@@ -247,7 +262,7 @@ app.post('/send', (req, res, next) => {
   req.chatContext = `order:${req.body.order_id}`;
   next();
 }, blockCheckMiddleware, rateLimiter, spamFilter, async (req, res) => {
-  const { order_id, sender_username, text } = req.body;
+  const { order_id, sender_username, text, reply_to } = req.body;
   if (!order_id || !sender_username || !text)
     return res.status(400).json({ error: 'order_id, sender_username, text required' });
 
@@ -259,6 +274,7 @@ app.post('/send', (req, res, next) => {
     const role = chat.buyerUsername === sender_username ? '🛒 Buyer' : '🏪 Seller';
     const localId = Date.now();
     const shopMatch = String(order_id).match(/^shop_(\d+)_/);
+    const replyTo = reply_to?.id ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null } : null;
 
     const payload = {
       id: localId,
@@ -266,12 +282,14 @@ app.post('/send', (req, res, next) => {
       senderUsername: sender_username,
       isSystem: false,
       timestamp: Math.floor(localId / 1000),
+      replyTo,
     };
     sseBroadcast(`order:${order_id}`, payload);
     if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...payload, order_id });
     res.json({ msgId: localId });
 
-    dc.sendTextMsg(botId, chat.chatId, `${role} (${sender_username}): ${text}`)
+    const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
+    dc.sendTextMsg(botId, chat.chatId, `${role} (${sender_username}): ${text}`, replyToId)
       .then((realMsgId) => {
         sseBroadcast(`order:${order_id}`, { type: 'message_id_updated', localId, realId: realMsgId });
         if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { type: 'message_id_updated', localId, realId: realMsgId, order_id });
@@ -429,7 +447,7 @@ app.post('/groups/:community_id/send',
   spamFilter,
   async (req, res) => {
     const { community_id } = req.params;
-    const { sender_username, text } = req.body;
+    const { sender_username, text, reply_to } = req.body;
     if (!sender_username || !text)
       return res.status(400).json({ error: 'sender_username and text required' });
 
@@ -441,17 +459,20 @@ app.post('/groups/:community_id/send',
       const localId = Date.now();
 
       const nowSec = Math.floor(localId / 1000);
+      const replyTo = reply_to?.id ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null } : null;
       sseBroadcast(`community:${community_id}`, {
         id: localId,
         text,
         senderUsername: sender_username,
         isSystem: false,
         timestamp: nowSec,
+        replyTo,
       });
       store.setGroupLastMessage(community_id, { text, senderUsername: sender_username, timestamp: nowSec });
       res.json({ msgId: localId });
 
-      dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`)
+      const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
+      dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`, replyToId)
         .then((realMsgId) => {
           sseBroadcast(`community:${community_id}`, { type: 'message_id_updated', localId, realId: realMsgId });
         })
@@ -1034,7 +1055,7 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
   next();
 }, blockCheckMiddleware, rateLimiter, spamFilter, async (req, res) => {
   const { dm_key } = req.params;
-  const { sender_username, text } = req.body;
+  const { sender_username, text, reply_to } = req.body;
   if (!sender_username || !text) return res.status(400).json({ error: 'sender_username and text required' });
 
   try {
@@ -1046,17 +1067,20 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     const localId = Date.now();
 
     const nowSec = Math.floor(localId / 1000);
+    const replyTo = reply_to?.id ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null } : null;
     sseBroadcast(`dm:${dm_key}`, {
       id: localId,
       text,
       senderUsername: sender_username,
       isSystem: false,
       timestamp: nowSec,
+      replyTo,
     });
     store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
     res.json({ msgId: localId });
 
-    dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`)
+    const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
+    dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`, replyToId)
       .then((realMsgId) => {
         sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId: realMsgId });
       })

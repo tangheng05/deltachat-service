@@ -76,8 +76,10 @@ export class DeltaChatClient extends EventEmitter {
 
   // ── Messages ─────────────────────────────────────────────────────
 
-  sendTextMsg(accountId, chatId, text) {
-    return this._dc.rpc.sendMsg(accountId, chatId, { text });
+  sendTextMsg(accountId, chatId, text, quotedMsgId = null) {
+    const msg = { text };
+    if (quotedMsgId && typeof quotedMsgId === 'number') msg.quotedMessageId = quotedMsgId;
+    return this._dc.rpc.sendMsg(accountId, chatId, msg);
   }
 
   getMessage(accountId, msgId) { return this._dc.rpc.getMessage(accountId, msgId); }
