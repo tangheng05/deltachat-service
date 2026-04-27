@@ -114,20 +114,6 @@ dc.on('IncomingMsg', async (contextId, event) => {
         sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...formatted, order_id: orderId });
       }
     }
-    if (communityId && !formatted.isSystem && formatted.text) {
-      store.setGroupLastMessage(communityId, {
-        text: formatted.text,
-        senderUsername: formatted.senderUsername,
-        timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
-      });
-    }
-    if (dmKey && !formatted.isSystem && formatted.text) {
-      store.setDmLastMessage(dmKey, {
-        text: formatted.text,
-        senderUsername: formatted.senderUsername,
-        timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
-      });
-    }
   } catch (e) {
     console.error('[IncomingMsg] failed to fetch message:', e.message);
   }
