@@ -341,7 +341,25 @@ export class Store {
     const mutedDms = this.data.moderation.mutedDms[username] ?? [];
     return Object.entries(this.data.directMessages)
       .filter(([, info]) => info.userA === username || info.userB === username)
-      .map(([dmKey, info]) => ({ dmKey, ...info, muted: mutedDms.includes(dmKey) }));
+      .map(([dmKey, info]) => ({
+        dmKey, ...info, muted: mutedDms.includes(dmKey),
+        unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+      }));
+  }
+
+  setDmLastActivity(dmKey, unixSeconds) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm) return;
+    dm.lastMessageAt = unixSeconds;
+    this._save();
+  }
+
+  setDmLastSeen(dmKey, username, unixSeconds) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm) return;
+    dm.lastSeenBy ??= {};
+    dm.lastSeenBy[username] = unixSeconds;
+    this._save();
   }
 
   // ── DM mute ───────────────────────────────────────────────────────

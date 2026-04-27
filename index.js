@@ -114,6 +114,9 @@ dc.on('IncomingMsg', async (contextId, event) => {
         sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...formatted, order_id: orderId });
       }
     }
+    if (dmKey) {
+      store.setDmLastActivity(dmKey, formatted.timestamp || Math.floor(Date.now() / 1000));
+    }
   } catch (e) {
     console.error('[IncomingMsg] failed to fetch message:', e.message);
   }
@@ -977,13 +980,15 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     const botId = await ensureBotAccount();
     const localId = Date.now();
 
+    const nowSec = Math.floor(localId / 1000);
     sseBroadcast(`dm:${dm_key}`, {
       id: localId,
       text,
       senderUsername: sender_username,
       isSystem: false,
-      timestamp: Math.floor(localId / 1000),
+      timestamp: nowSec,
     });
+    store.setDmLastActivity(dm_key, nowSec);
     res.json({ msgId: localId });
 
     dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`)
@@ -1054,6 +1059,19 @@ app.delete('/dm/:dm_key/mute', (req, res) => {
   if (!dm) return res.status(404).json({ error: 'DM not found' });
   store.unmuteDm(username, dm_key);
   res.json({ success: true });
+});
+
+// ── POST /dm/:dm_key/seen ─────────────────────────────────────────────
+app.post('/dm/:dm_key/seen', (req, res) => {
+  const { dm_key } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+  if (dm.userA !== username && dm.userB !== username)
+    return res.status(403).json({ error: 'Not a participant' });
+  store.setDmLastSeen(dm_key, username, Math.floor(Date.now() / 1000));
+  res.json({ ok: true });
 });
 
 // ── DELETE /dm/:dm_key/messages/:message_id ───────────────────────────
