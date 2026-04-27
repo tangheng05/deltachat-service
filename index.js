@@ -212,23 +212,29 @@ app.post('/send', (req, res, next) => {
 
     const botId = await ensureBotAccount();
     const role = chat.buyerUsername === sender_username ? '🛒 Buyer' : '🏪 Seller';
-    const msgId = await dc.sendTextMsg(botId, chat.chatId, `${role} (${sender_username}): ${text}`);
+    const localId = Date.now();
+    const shopMatch = String(order_id).match(/^shop_(\d+)_/);
 
     const payload = {
-      id: msgId,
+      id: localId,
       text,
       senderUsername: sender_username,
       isSystem: false,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Math.floor(localId / 1000),
     };
     sseBroadcast(`order:${order_id}`, payload);
-    const shopMatch = String(order_id).match(/^shop_(\d+)_/);
     if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...payload, order_id });
+    res.json({ msgId: localId });
 
-    res.json({ msgId });
+    dc.sendTextMsg(botId, chat.chatId, `${role} (${sender_username}): ${text}`)
+      .then((realMsgId) => {
+        sseBroadcast(`order:${order_id}`, { type: 'message_id_updated', localId, realId: realMsgId });
+        if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { type: 'message_id_updated', localId, realId: realMsgId, order_id });
+      })
+      .catch(e => console.error('[/send] DC error:', e.message));
   } catch (e) {
     console.error('[/send]', e.message);
-    res.status(500).json({ error: e.message });
+    if (!res.headersSent) res.status(500).json({ error: e.message });
   }
 });
 
