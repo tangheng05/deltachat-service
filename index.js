@@ -433,6 +433,11 @@ app.get('/groups/:community_id/messages', async (req, res) => {
       await Promise.all(recent.map((id) => dc.getMessage(botId, id).catch(() => null)))
     ).filter(Boolean).map(formatMessage);
 
+    if (!group.lastMessage) {
+      const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
+      if (last) store.setGroupLastMessage(community_id, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
+    }
+
     res.json({ messages });
   } catch (e) {
     console.error('[/groups/:id/messages]', e.message);
@@ -1028,6 +1033,11 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     const messages = (
       await Promise.all(msgIds.map((id) => dc.getMessage(botId, id).catch(() => null)))
     ).filter(Boolean).map(formatMessage);
+
+    if (!dm.lastMessage) {
+      const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
+      if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
+    }
 
     res.json({ messages });
   } catch (e) {
