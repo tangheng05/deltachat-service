@@ -135,6 +135,13 @@ export class Store {
     this._save();
   }
 
+  setGroupLastMessage(communityId, { text, senderUsername, timestamp }) {
+    const group = this.data.communityGroups[String(communityId)];
+    if (!group) return;
+    group.lastMessage = { text, senderUsername, timestamp };
+    this._save();
+  }
+
   addCommunityMember(communityId, username) {
     const group = this.data.communityGroups[String(communityId)];
     if (!group || group.memberUsernames.includes(username)) return;
@@ -344,6 +351,7 @@ export class Store {
       .map(([dmKey, info]) => ({
         dmKey, ...info, muted: mutedDms.includes(dmKey),
         unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+        lastMessage: info.lastMessage || null,
       }));
   }
 
@@ -351,6 +359,14 @@ export class Store {
     const dm = this.data.directMessages[dmKey];
     if (!dm) return;
     dm.lastMessageAt = unixSeconds;
+    this._save();
+  }
+
+  setDmLastMessage(dmKey, { text, senderUsername, timestamp }) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm) return;
+    dm.lastMessage = { text, senderUsername, timestamp };
+    dm.lastMessageAt = timestamp;
     this._save();
   }
 

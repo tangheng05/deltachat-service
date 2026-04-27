@@ -114,8 +114,19 @@ dc.on('IncomingMsg', async (contextId, event) => {
         sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...formatted, order_id: orderId });
       }
     }
-    if (dmKey) {
-      store.setDmLastActivity(dmKey, formatted.timestamp || Math.floor(Date.now() / 1000));
+    if (communityId && !formatted.isSystem && formatted.text) {
+      store.setGroupLastMessage(communityId, {
+        text: formatted.text,
+        senderUsername: formatted.senderUsername,
+        timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
+      });
+    }
+    if (dmKey && !formatted.isSystem && formatted.text) {
+      store.setDmLastMessage(dmKey, {
+        text: formatted.text,
+        senderUsername: formatted.senderUsername,
+        timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
+      });
     }
   } catch (e) {
     console.error('[IncomingMsg] failed to fetch message:', e.message);
@@ -383,13 +394,15 @@ app.post('/groups/:community_id/send',
       const botId = await ensureBotAccount();
       const localId = Date.now();
 
+      const nowSec = Math.floor(localId / 1000);
       sseBroadcast(`community:${community_id}`, {
         id: localId,
         text,
         senderUsername: sender_username,
         isSystem: false,
-        timestamp: Math.floor(localId / 1000),
+        timestamp: nowSec,
       });
+      store.setGroupLastMessage(community_id, { text, senderUsername: sender_username, timestamp: nowSec });
       res.json({ msgId: localId });
 
       dc.sendTextMsg(botId, group.chatId, `💬 (${sender_username}): ${text}`)
@@ -522,6 +535,7 @@ app.get('/groups', (req, res) => {
       role: username ? ((info.roles ?? {})[username] ?? null) : undefined,
       isMember: username ? info.memberUsernames.includes(username) : false,
       isPending: username ? !!(info.pendingMembers ?? {})[username] : false,
+      lastMessage: info.lastMessage || null,
     }));
   res.json({ groups });
 });
@@ -988,7 +1002,7 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       isSystem: false,
       timestamp: nowSec,
     });
-    store.setDmLastActivity(dm_key, nowSec);
+    store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
     res.json({ msgId: localId });
 
     dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`)
