@@ -143,10 +143,10 @@ export class Store {
     this._save();
   }
 
-  setGroupLastMessage(communityId, { text, senderUsername, timestamp }) {
+  setGroupLastMessage(communityId, msg) {
     const group = this.data.communityGroups[String(communityId)];
     if (!group) return;
-    group.lastMessage = { text, senderUsername, timestamp };
+    group.lastMessage = msg ? { text: msg.text, senderUsername: msg.senderUsername, timestamp: msg.timestamp } : null;
     this._save();
   }
 

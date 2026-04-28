@@ -539,6 +539,22 @@ app.delete('/groups/:community_id/messages/:msg_id', async (req, res) => {
     if (!isOwn && !canModerate) return res.status(403).json({ error: 'Not allowed' });
 
     await dc.deleteMessages(botId, [Number(msg_id)]);
+
+    // Re-derive lastMessage — the deleted message may have been the most recent one
+    try {
+      const allIds = await dc.getMessageIds(botId, group.chatId);
+      let newLast = null;
+      for (const id of [...allIds].reverse().slice(0, 20)) {
+        const m = await dc.getMessage(botId, id).catch(() => null);
+        if (!m) continue;
+        const fm = formatMessage(m);
+        if (fm.text && !fm.isSystem) { newLast = fm; break; }
+      }
+      store.setGroupLastMessage(community_id, newLast
+        ? { text: newLast.text, senderUsername: newLast.senderUsername, timestamp: newLast.timestamp || Math.floor(Date.now() / 1000) }
+        : null);
+    } catch {}
+
     sseBroadcast(`community:${community_id}`, { type: 'message_deleted', id: Number(msg_id) });
     res.json({ success: true });
   } catch (e) {
@@ -562,6 +578,7 @@ app.delete('/groups/:community_id/messages', async (req, res) => {
     const botId = await ensureBotAccount();
     const msgIds = await dc.getMessageIds(botId, group.chatId);
     if (msgIds.length) await dc.deleteMessages(botId, msgIds);
+    store.setGroupLastMessage(community_id, null);
     sseBroadcast(`community:${community_id}`, { type: 'messages_cleared' });
     res.json({ success: true, deleted: msgIds.length });
   } catch (e) {
@@ -608,6 +625,7 @@ app.get('/groups', (req, res) => {
       isMember: username ? info.memberUsernames.includes(username) : false,
       isPending: username ? !!(info.pendingMembers ?? {})[username] : false,
       lastMessage: info.lastMessage || null,
+      lastSeenAt: username ? ((info.lastSeenBy ?? {})[username] ?? 0) : 0,
     }));
   res.json({ groups });
 });
