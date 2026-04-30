@@ -94,6 +94,66 @@ async function ensureBotAccount() {
   return _botProvisionPromise;
 }
 
+// ── Per-user account provisioning ───────────────────────────────────
+const _userProvisionMap = new Map();
+
+async function ensureUserAccount(username) {
+  const cached = store.getAccount(username);
+  if (cached?.accountId) return cached;
+
+  if (_userProvisionMap.has(username)) return _userProvisionMap.get(username);
+
+  const promise = (async () => {
+    try {
+      const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
+      await withTimeout(
+        dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`),
+        20_000, 'setConfigFromQr'
+      );
+      await dc.setConfig(accountId, 'displayname', username);
+      await withTimeout(dc.configure(accountId), 30_000, 'configure');
+      // configure() calls startIo internally — stop it so IO only runs while
+      // the user has an active SSE connection (acquireAccountIo manages this).
+      await dc.rpc.stopIo(accountId).catch(() => {});
+      const addr     = await dc.getConfig(accountId, 'addr');
+      const password = await dc.getConfig(accountId, 'mail_pw');
+      const info = { accountId, addr, password };
+      store.setAccount(username, info);
+      console.log(`[user-account] provisioned ${username} → ${addr}`);
+      return info;
+    } finally {
+      _userProvisionMap.delete(username);
+    }
+  })();
+
+  _userProvisionMap.set(username, promise);
+  return promise;
+}
+
+// ── Per-account IO lifecycle ─────────────────────────────────────────
+// IO runs only while the user has at least one open SSE connection.
+const accountIoRefs = new Map(); // accountId → refCount
+
+function acquireAccountIo(accountId) {
+  const count = (accountIoRefs.get(accountId) || 0) + 1;
+  accountIoRefs.set(accountId, count);
+  if (count === 1) {
+    dc.rpc.startIo(accountId).catch((e) =>
+      console.error(`[io] startIo(${accountId}):`, e.message)
+    );
+  }
+}
+
+function releaseAccountIo(accountId) {
+  const count = Math.max(0, (accountIoRefs.get(accountId) || 0) - 1);
+  accountIoRefs.set(accountId, count);
+  if (count === 0) {
+    dc.rpc.stopIo(accountId).catch((e) =>
+      console.error(`[io] stopIo(${accountId}):`, e.message)
+    );
+  }
+}
+
 // ── SSE registry ────────────────────────────────────────────────────
 // chatKey: "order:<id>" | "community:<id>" | "dm:<dmKey>" | "shopinbox:<id>"
 const sseClients = new Map();
@@ -123,20 +183,63 @@ function sseBroadcast(chatKey, payload) {
 dc.on('IncomingMsg', async (contextId, event) => {
   const { chatId, msgId } = event;
 
-  const orderId = store.findOrderIdByChatId(chatId);
+  const orderId     = store.findOrderIdByChatId(chatId);
   const communityId = orderId ? null : store.findCommunityIdByChatId(chatId);
-  const dmKey = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId) : null;
+  let   dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId) : null;
+
+  // Handle inbound from DC mobile — chatId not yet in store
+  if (!orderId && !communityId && !dmKey) {
+    try {
+      const msg         = await dc.getMessage(contextId, msgId);
+      const contact     = await dc.getContact(contextId, msg.fromId);
+      const senderAddr  = contact.address;
+      const senderUser  = store.findUsernameByAddr(senderAddr);
+      const receiverUser = store.findUsernameByAccountId(contextId);
+
+      if (senderUser && receiverUser) {
+        const [u1, u2] = [senderUser, receiverUser].sort();
+        dmKey = `${u1}:${u2}`;
+
+        if (!store.getDm(dmKey)) {
+          const receiverInfo = store.getAccount(receiverUser);
+          store.setDm(dmKey, {
+            userA: u1, userB: u2,
+            userAAccountId: u1 === receiverUser ? receiverInfo.accountId : null,
+            userAChatId:    u1 === receiverUser ? chatId : null,
+            userBAccountId: u2 === receiverUser ? receiverInfo.accountId : null,
+            userBChatId:    u2 === receiverUser ? chatId : null,
+            createdAt: Date.now(),
+          });
+          console.log(`[IncomingMsg] auto-created DM for mobile sender ${senderAddr} → ${dmKey}`);
+        }
+      }
+    } catch (e) {
+      console.error('[IncomingMsg] mobile-sender lookup failed:', e.message);
+    }
+  }
 
   if (!orderId && !communityId && !dmKey) return;
 
-  let chatKey;
-  if (orderId) chatKey = `order:${orderId}`;
-  else if (communityId) chatKey = `community:${communityId}`;
-  else chatKey = `dm:${dmKey}`;
+  const chatKey = orderId     ? `order:${orderId}`
+                : communityId ? `community:${communityId}`
+                :               `dm:${dmKey}`;
 
   try {
     const msg = await dc.getMessage(contextId, msgId);
-    const formatted = formatMessage(msg);
+
+    let formatted;
+    if (dmKey) {
+      const dm = store.getDm(dmKey);
+      if (dm && !dm.chatId) {
+        const ownerUser = dm.userAAccountId === contextId ? dm.userA : dm.userB;
+        formatted = formatDmMessage(msg, dm, ownerUser);
+      } else {
+        formatted = formatMessage(msg);
+      }
+    } else {
+      formatted = formatMessage(msg);
+    }
+
     sseBroadcast(chatKey, formatted);
 
     if (orderId) {
@@ -179,6 +282,30 @@ function formatMessage(msg) {
   };
 }
 
+function formatDmMessage(msg, dm, viewerUsername) {
+  let replyTo = null;
+  if (msg.quote?.text) {
+    const qt = msg.quote.text;
+    replyTo = {
+      id: msg.quote.msgId || null,
+      text: qt.substring(0, 200),
+      senderUsername: msg.quote.authorDisplayName || null,
+    };
+  }
+  const senderUsername = msg.isOutgoing
+    ? viewerUsername
+    : (viewerUsername === dm.userA ? dm.userB : dm.userA);
+  return {
+    id: msg.id,
+    text: msg.text || '',
+    senderUsername,
+    isSystem: false,
+    timestamp: msg.timestamp,
+    chatId: msg.chatId,
+    replyTo,
+  };
+}
+
 const rand = (bytes) => randomBytes(bytes).toString('hex');
 
 // ── Express ──────────────────────────────────────────────────────────
@@ -207,20 +334,8 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', domain: CHATMAIL_DOMA
 app.post('/accounts', async (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'username required' });
-
   try {
-    let info = store.getAccount(username);
-    if (!info) {
-      const accountId = await dc.addAccount();
-      await dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`);
-      await dc.setConfig(accountId, 'displayname', username);
-      await dc.configure(accountId);
-      const addr = await dc.getConfig(accountId, 'addr');
-      const password = await dc.getConfig(accountId, 'mail_pw');
-      info = { accountId, addr, password };
-      store.setAccount(username, info);
-      console.log(`[accounts] provisioned ${username} → ${addr}`);
-    }
+    const info = await ensureUserAccount(username);
     res.json({ username, addr: info.addr });
   } catch (e) {
     console.error('[/accounts]', e.message);
@@ -1045,14 +1160,32 @@ app.post('/dm', async (req, res) => {
 
   try {
     let dm = store.getDm(dmKey);
-    if (!dm) {
-      const botId = await ensureBotAccount();
-      const chatId = await dc.createGroupChat(botId, `DM:${dmKey}`);
-      dm = { chatId, userA: u1, userB: u2, createdAt: Date.now() };
-      store.setDm(dmKey, dm);
-      console.log(`[dm] created — dmKey=${dmKey} chatId=${chatId}`);
+
+    if (dm && dm.chatId && !dm.userAAccountId) {
+      // Legacy bot-DM — return as-is until migration runs
+      return res.json({ dmKey, userA: dm.userA, userB: dm.userB, legacy: true });
     }
-    res.json({ dmKey, chatId: dm.chatId, userA: dm.userA, userB: dm.userB });
+
+    if (!dm) {
+      const [infoA, infoB] = await Promise.all([
+        ensureUserAccount(u1),
+        ensureUserAccount(u2),
+      ]);
+      const contactInA = await dc.createContact(infoA.accountId, infoB.addr, u2);
+      const contactInB = await dc.createContact(infoB.accountId, infoA.addr, u1);
+      const chatIdA    = await dc.createChatByContactId(infoA.accountId, contactInA);
+      const chatIdB    = await dc.createChatByContactId(infoB.accountId, contactInB);
+      dm = {
+        userA: u1, userB: u2,
+        userAAccountId: infoA.accountId, userAChatId: chatIdA,
+        userBAccountId: infoB.accountId, userBChatId: chatIdB,
+        createdAt: Date.now(),
+      };
+      store.setDm(dmKey, dm);
+      console.log(`[dm] created per-user DM — dmKey=${dmKey}`);
+    }
+
+    res.json({ dmKey, userA: dm.userA, userB: dm.userB });
   } catch (e) {
     console.error('[/dm]', e.message);
     res.status(500).json({ error: e.message });
@@ -1065,9 +1198,7 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
   const { sender_username } = req.body;
   const dm = store.getDm(dm_key);
   if (!dm) return res.status(404).json({ error: 'DM not found — call POST /dm first' });
-
   const other = dm.userA === sender_username ? dm.userB : dm.userA;
-  // Check both directions: recipient blocked sender, OR sender blocked recipient
   req.blockCheckPairs = [[sender_username, other], [other, sender_username]];
   req.chatContext = `dm:${dm_key}`;
   next();
@@ -1081,28 +1212,37 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     if (dm.userA !== sender_username && dm.userB !== sender_username)
       return res.status(403).json({ error: 'Not a participant in this DM' });
 
-    const botId = await ensureBotAccount();
     const localId = Date.now();
+    const nowSec  = Math.floor(localId / 1000);
+    const replyTo = reply_to?.id
+      ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null }
+      : null;
 
-    const nowSec = Math.floor(localId / 1000);
-    const replyTo = reply_to?.id ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null } : null;
-    sseBroadcast(`dm:${dm_key}`, {
-      id: localId,
-      text,
-      senderUsername: sender_username,
-      isSystem: false,
-      timestamp: nowSec,
-      replyTo,
-    });
+    // Legacy bot-DM fallback
+    if (dm.chatId && !dm.userAAccountId) {
+      const botId = await ensureBotAccount();
+      sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
+      store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
+      res.json({ msgId: localId });
+      const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
+      dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`, replyToId)
+        .then((realId) => sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId }))
+        .catch((e) => console.error('[/dm/send legacy]', e.message));
+      return;
+    }
+
+    // Per-user send — plain text, no prefix
+    const senderInfo = store.getDmAccountAndChat(dm_key, sender_username);
+    if (!senderInfo) return res.status(500).json({ error: 'Sender account not found' });
+
+    sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
     store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
     res.json({ msgId: localId });
 
     const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
-    dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`, replyToId)
-      .then((realMsgId) => {
-        sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId: realMsgId });
-      })
-      .catch(e => console.error('[/dm/:key/send] DC error:', e.message));
+    dc.sendTextMsg(senderInfo.accountId, senderInfo.chatId, text, replyToId)
+      .then((realId) => sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId }))
+      .catch((e) => console.error('[/dm/:key/send]', e.message));
   } catch (e) {
     console.error('[/dm/:key/send]', e.message);
     if (!res.headersSent) res.status(500).json({ error: e.message });
@@ -1112,19 +1252,39 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
 // ── GET /dm/:dm_key/messages ──────────────────────────────────────────
 app.get('/dm/:dm_key/messages', async (req, res) => {
   const { dm_key } = req.params;
+  const { username } = req.query;
   try {
     const dm = store.getDm(dm_key);
-    if (!dm) return res.json({ messages: [] });
+    if (!dm) return res.json({ messages: [], lastSeenBy: {} });
 
-    const botId = await ensureBotAccount();
-    const msgIds = await dc.getMessageIds(botId, dm.chatId);
-    const messages = (
-      await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id))
-    ).filter(Boolean).map(formatMessage);
+    // Legacy bot-DM fallback
+    if (dm.chatId && !dm.userAAccountId) {
+      const botId  = await ensureBotAccount();
+      const msgIds = await dc.getMessageIds(botId, dm.chatId);
+      const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id)))
+        .filter(Boolean).map(formatMessage);
+      if (!dm.lastMessage) {
+        const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
+        if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
+      }
+      return res.json({ messages, lastSeenBy: dm.lastSeenBy || {} });
+    }
+
+    // Per-user: read from the requesting user's side
+    let accountId, chatId;
+    if (username === dm.userA) { accountId = dm.userAAccountId; chatId = dm.userAChatId; }
+    else                       { accountId = dm.userBAccountId; chatId = dm.userBChatId; }
+
+    // Start IO briefly to ensure IMAP is synced
+    await dc.rpc.startIo(accountId).catch(() => {});
+
+    const msgIds   = await dc.getMessageIds(accountId, chatId);
+    const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(accountId, id)))
+      .filter(Boolean).map((msg) => formatDmMessage(msg, dm, username));
 
     if (!dm.lastMessage) {
       const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
-      if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
+      if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
     }
 
     res.json({ messages, lastSeenBy: dm.lastSeenBy || {} });
@@ -1137,6 +1297,7 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
 // ── GET /dm/:dm_key/events ────────────────────────────────────────────
 app.get('/dm/:dm_key/events', (req, res) => {
   const { dm_key } = req.params;
+  const { username } = req.query;
   const chatKey = `dm:${dm_key}`;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1146,7 +1307,20 @@ app.get('/dm/:dm_key/events', (req, res) => {
   res.write('data: {"type":"connected"}\n\n');
 
   sseRegister(chatKey, res);
-  req.on('close', () => sseUnregister(chatKey, res));
+
+  let accountId = null;
+  if (username) {
+    const info = store.getAccount(username);
+    if (info?.accountId) {
+      accountId = info.accountId;
+      acquireAccountIo(accountId);
+    }
+  }
+
+  req.on('close', () => {
+    sseUnregister(chatKey, res);
+    if (accountId) releaseAccountIo(accountId);
+  });
 });
 
 // ── POST /dm/:dm_key/mute ─────────────────────────────────────────────
@@ -1214,10 +1388,19 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
     return res.status(403).json({ error: 'Not a participant' });
 
   try {
-    const botId = await ensureBotAccount();
     const msgIdNum = parseInt(message_id, 10);
     if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
-    await dc.deleteMessages(botId, [msgIdNum]);
+
+    let deleteAccountId;
+    if (dm.chatId && !dm.userAAccountId) {
+      deleteAccountId = await ensureBotAccount();
+    } else {
+      const info = store.getDmAccountAndChat(dm_key, sender_username);
+      if (!info) return res.status(500).json({ error: 'Account not found' });
+      deleteAccountId = info.accountId;
+    }
+
+    await dc.deleteMessages(deleteAccountId, [msgIdNum]);
     sseBroadcast(`dm:${dm_key}`, { type: 'message_deleted', id: msgIdNum });
     res.json({ success: true });
   } catch (e) {
@@ -1270,8 +1453,17 @@ app.delete('/dm/:dm_key', async (req, res) => {
     return res.status(403).json({ error: 'Not a participant' });
 
   try {
-    const botId = await ensureBotAccount();
-    await dc.deleteChat(botId, dm.chatId);
+    if (dm.chatId && !dm.userAAccountId) {
+      // Legacy bot-DM
+      const botId = await ensureBotAccount();
+      await dc.deleteChat(botId, dm.chatId);
+    } else {
+      // Per-user DM — delete both sides
+      await Promise.all([
+        dm.userAAccountId ? dc.deleteChat(dm.userAAccountId, dm.userAChatId) : null,
+        dm.userBAccountId ? dc.deleteChat(dm.userBAccountId, dm.userBChatId) : null,
+      ].filter(Boolean));
+    }
     store.deleteDm(dm_key);
     res.json({ success: true });
   } catch (e) {

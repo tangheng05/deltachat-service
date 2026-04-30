@@ -66,6 +66,22 @@ export class DeltaChatClient extends EventEmitter {
     return this._dc.rpc.createGroupChat(accountId, name, protect);
   }
 
+  createChatByContactId(accountId, contactId) {
+    return this._dc.rpc.createChatByContactId(accountId, contactId);
+  }
+
+  stopIo(accountId) {
+    return this._dc.rpc.stopIo(accountId);
+  }
+
+  getAllAccounts() {
+    return this._dc.rpc.getAllAccounts();
+  }
+
+  getContact(accountId, contactId) {
+    return this._dc.rpc.getContact(accountId, contactId);
+  }
+
   addContactToChat(accountId, chatId, contactId) {
     return this._dc.rpc.addContactToChat(accountId, chatId, contactId);
   }

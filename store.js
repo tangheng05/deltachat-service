@@ -345,7 +345,32 @@ export class Store {
 
   findDmKeyByChatId(chatId) {
     for (const [key, info] of Object.entries(this.data.directMessages)) {
-      if (info.chatId === chatId) return key;
+      if (info.userAChatId === chatId || info.userBChatId === chatId) return key;
+      if (info.chatId === chatId) return key; // legacy bot-DM fallback
+    }
+    return null;
+  }
+
+  getDmAccountAndChat(dmKey, senderUsername) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm) return null;
+    if (dm.userA === senderUsername) return { accountId: dm.userAAccountId, chatId: dm.userAChatId };
+    if (dm.userB === senderUsername) return { accountId: dm.userBAccountId, chatId: dm.userBChatId };
+    return null;
+  }
+
+  findUsernameByAddr(addr) {
+    for (const [username, info] of Object.entries(this.data.accounts)) {
+      if (username === '__bot__') continue;
+      if (info.addr === addr) return username;
+    }
+    return null;
+  }
+
+  findUsernameByAccountId(accountId) {
+    for (const [username, info] of Object.entries(this.data.accounts)) {
+      if (username === '__bot__') continue;
+      if (info.accountId === accountId) return username;
     }
     return null;
   }
