@@ -354,8 +354,8 @@ export class Store {
   getDmAccountAndChat(dmKey, senderUsername) {
     const dm = this.data.directMessages[dmKey];
     if (!dm) return null;
-    if (dm.userA === senderUsername) return { accountId: dm.userAAccountId, chatId: dm.userAChatId };
-    if (dm.userB === senderUsername) return { accountId: dm.userBAccountId, chatId: dm.userBChatId };
+    if (dm.userA === senderUsername && dm.userAAccountId) return { accountId: dm.userAAccountId, chatId: dm.userAChatId };
+    if (dm.userB === senderUsername && dm.userBAccountId) return { accountId: dm.userBAccountId, chatId: dm.userBChatId };
     return null;
   }
 

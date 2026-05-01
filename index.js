@@ -1275,9 +1275,6 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     if (username === dm.userA) { accountId = dm.userAAccountId; chatId = dm.userAChatId; }
     else                       { accountId = dm.userBAccountId; chatId = dm.userBChatId; }
 
-    // Start IO briefly to ensure IMAP is synced
-    await dc.rpc.startIo(accountId).catch(() => {});
-
     const msgIds   = await dc.getMessageIds(accountId, chatId);
     const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(accountId, id)))
       .filter(Boolean).map((msg) => formatDmMessage(msg, dm, username));
