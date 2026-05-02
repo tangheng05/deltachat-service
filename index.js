@@ -2,8 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { DeltaChatClient } from './dc-client.js';
@@ -112,9 +113,7 @@ async function ensureUserAccount(username) {
       );
       await dc.setConfig(accountId, 'displayname', username);
       await withTimeout(dc.configure(accountId), 30_000, 'configure');
-      // configure() calls startIo internally — stop it so IO only runs while
-      // the user has an active SSE connection (acquireAccountIo manages this).
-      await dc.rpc.stopIo(accountId).catch(() => {});
+      // configure() starts IO; keep it running so IMAP stays synced always.
       const addr     = await dc.getConfig(accountId, 'addr');
       const password = await dc.getConfig(accountId, 'mail_pw');
       const info = { accountId, addr, password };
@@ -154,6 +153,29 @@ function releaseAccountIo(accountId) {
   }
 }
 
+// Sends a zero-width-space from each account to the other so both sides'
+// Autocrypt keys land in each other's IMAP inbox. When a mobile user logs in
+// and syncs, DC picks up the key from this message and can immediately send
+// encrypted messages — avoiding the "Encryption Needed" chatmail rejection.
+async function bootstrapDmKeys(accountIdA, chatIdA, accountIdB, chatIdB) {
+  try {
+    acquireAccountIo(accountIdA);
+    acquireAccountIo(accountIdB);
+    await new Promise((r) => setTimeout(r, 3_000)); // wait for IMAP/SMTP connect
+    await Promise.all([
+      dc.sendTextMsg(accountIdA, chatIdA, '​'),
+      dc.sendTextMsg(accountIdB, chatIdB, '​'),
+    ]);
+    await new Promise((r) => setTimeout(r, 12_000)); // wait for SMTP delivery
+    console.log(`[dm bootstrap] key exchange sent (A=${accountIdA} B=${accountIdB})`);
+  } catch (e) {
+    console.error('[dm bootstrap] failed:', e.message);
+  } finally {
+    releaseAccountIo(accountIdA);
+    releaseAccountIo(accountIdB);
+  }
+}
+
 // ── SSE registry ────────────────────────────────────────────────────
 // chatKey: "order:<id>" | "community:<id>" | "dm:<dmKey>" | "shopinbox:<id>"
 const sseClients = new Map();
@@ -185,9 +207,11 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
   const orderId     = store.findOrderIdByChatId(chatId);
   const communityId = orderId ? null : store.findCommunityIdByChatId(chatId);
-  let   dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId) : null;
+  // Pass contextId so chatId numbers from different accounts don't collide
+  let   dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId, contextId) : null;
 
-  // Handle inbound from DC mobile — chatId not yet in store
+  // Handle inbound from DC mobile — chatId not yet in store, or landed in a
+  // contact-request chat with a new chatId (different from the provisioned one).
   if (!orderId && !communityId && !dmKey) {
     try {
       const msg         = await dc.getMessage(contextId, msgId);
@@ -199,8 +223,9 @@ dc.on('IncomingMsg', async (contextId, event) => {
       if (senderUser && receiverUser) {
         const [u1, u2] = [senderUser, receiverUser].sort();
         dmKey = `${u1}:${u2}`;
+        const existingDm = store.getDm(dmKey);
 
-        if (!store.getDm(dmKey)) {
+        if (!existingDm) {
           const receiverInfo = store.getAccount(receiverUser);
           store.setDm(dmKey, {
             userA: u1, userB: u2,
@@ -211,6 +236,19 @@ dc.on('IncomingMsg', async (contextId, event) => {
             createdAt: Date.now(),
           });
           console.log(`[IncomingMsg] auto-created DM for mobile sender ${senderAddr} → ${dmKey}`);
+        } else {
+          // Mobile message landed in a different chatId (e.g. contact-request chat).
+          // Accept it and update the stored chatId so future reads find it.
+          dc.rpc.acceptChat(contextId, chatId).catch(() => {});
+          const isUserA = existingDm.userAAccountId === contextId;
+          const storedChatId = isUserA ? existingDm.userAChatId : existingDm.userBChatId;
+          if (storedChatId !== chatId) {
+            const update = isUserA
+              ? { ...existingDm, userAChatId: chatId }
+              : { ...existingDm, userBChatId: chatId };
+            store.setDm(dmKey, update);
+            console.log(`[IncomingMsg] updated ${isUserA ? 'userA' : 'userB'} chatId ${storedChatId}→${chatId} for ${dmKey}`);
+          }
         }
       }
     } catch (e) {
@@ -226,6 +264,8 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
   try {
     const msg = await dc.getMessage(contextId, msgId);
+    if (!msg.text || msg.text === '​') return;
+    if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => msg.text.toLowerCase().includes(s))) return;
 
     let formatted;
     if (dmKey) {
@@ -282,17 +322,30 @@ function formatMessage(msg) {
   };
 }
 
+const DM_SYSTEM_NOISE = [
+  'requires end-to-end encryption',
+  'messages are end-to-end encrypted',
+  'end-to-end encrypted',
+  'this message cannot be decrypted',
+  'cannot be decrypted',
+  'message corrupted',
+];
+
 function formatDmMessage(msg, dm, viewerUsername) {
+  // DC info messages (encryption warnings, group notices, etc.) — surface as system
+  if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => (msg.text || '').toLowerCase().includes(s))) {
+    return { id: msg.id, text: msg.text || '', senderUsername: null, isSystem: true, timestamp: msg.timestamp, chatId: msg.chatId, replyTo: null };
+  }
   let replyTo = null;
   if (msg.quote?.text) {
-    const qt = msg.quote.text;
     replyTo = {
       id: msg.quote.msgId || null,
-      text: qt.substring(0, 200),
+      text: msg.quote.text.substring(0, 200),
       senderUsername: msg.quote.authorDisplayName || null,
     };
   }
-  const senderUsername = msg.isOutgoing
+  // DC message state > 16 = outgoing (18=preparing,19=draft,20=pending,24=failed,26=delivered,28=read)
+  const senderUsername = (msg.state > 16)
     ? viewerUsername
     : (viewerUsername === dm.userA ? dm.userB : dm.userA);
   return {
@@ -340,6 +393,62 @@ app.post('/accounts', async (req, res) => {
   } catch (e) {
     console.error('[/accounts]', e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /accounts/:username ───────────────────────────────────────────
+app.get('/accounts/:username', (req, res) => {
+  const { username } = req.params;
+  const info = store.getAccount(username);
+  if (!info?.addr) return res.status(404).json({ error: 'Account not found — call POST /accounts first' });
+  res.json({ username, addr: info.addr, password: info.password });
+});
+
+// ── GET /accounts/:username/qr ────────────────────────────────────────
+app.get('/accounts/:username/qr', async (req, res) => {
+  const { username } = req.params;
+  const info = store.getAccount(username);
+  if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
+  try {
+    acquireAccountIo(info.accountId);
+    await new Promise((r) => setTimeout(r, 1_500));
+    // chatId=null returns a "Setup Contact" invite QR (not group-specific)
+    const qr = await dc.rpc.getChatSecurejoinQrCode(info.accountId, null);
+    releaseAccountIo(info.accountId);
+    res.json({ qr });
+  } catch (e) {
+    releaseAccountIo(info.accountId);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /accounts/:username/key ───────────────────────────────────────
+// Exports the account's PGP private key as an .asc file so the user can
+// import it into DC mobile (Settings → Import Keys) to share the same
+// encryption identity as the web account.
+app.get('/accounts/:username/key', async (req, res) => {
+  const { username } = req.params;
+  const info = store.getAccount(username);
+  if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
+  const exportDir = join(tmpdir(), `dc-key-export-${info.accountId}-${Date.now()}`);
+  try {
+    mkdirSync(exportDir, { recursive: true });
+    acquireAccountIo(info.accountId);
+    await new Promise((r) => setTimeout(r, 1_000));
+    await dc.rpc.exportSelfKeys(info.accountId, exportDir, null);
+    releaseAccountIo(info.accountId);
+    const files = readdirSync(exportDir);
+    const keyFile = files.find((f) => f.endsWith('.asc'));
+    if (!keyFile) return res.status(500).json({ error: 'Key export produced no file' });
+    const keyData = readFileSync(join(exportDir, keyFile), 'utf8');
+    res.setHeader('Content-Type', 'application/pgp-keys');
+    res.setHeader('Content-Disposition', `attachment; filename="${username}-private-key.asc"`);
+    res.send(keyData);
+  } catch (e) {
+    releaseAccountIo(info.accountId);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { rmSync(exportDir, { recursive: true, force: true }); } catch {}
   }
 });
 
@@ -1179,10 +1288,15 @@ app.post('/dm', async (req, res) => {
         userA: u1, userB: u2,
         userAAccountId: infoA.accountId, userAChatId: chatIdA,
         userBAccountId: infoB.accountId, userBChatId: chatIdB,
-        createdAt: Date.now(),
+        createdAt: Date.now(), keyExchangeSent: true,
       };
       store.setDm(dmKey, dm);
       console.log(`[dm] created per-user DM — dmKey=${dmKey}`);
+      bootstrapDmKeys(infoA.accountId, chatIdA, infoB.accountId, chatIdB);
+    } else if (dm.userAAccountId && !dm.keyExchangeSent) {
+      // Existing DM that pre-dates the bootstrap — send it now
+      bootstrapDmKeys(dm.userAAccountId, dm.userAChatId, dm.userBAccountId, dm.userBChatId);
+      store.setDm(dmKey, { ...dm, keyExchangeSent: true });
     }
 
     res.json({ dmKey, userA: dm.userA, userB: dm.userB });
@@ -1271,13 +1385,13 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     }
 
     // Per-user: read from the requesting user's side
-    let accountId, chatId;
-    if (username === dm.userA) { accountId = dm.userAAccountId; chatId = dm.userAChatId; }
-    else                       { accountId = dm.userBAccountId; chatId = dm.userBChatId; }
+    const viewerUser = (username === dm.userA) ? dm.userA : dm.userB;
+    const accountId  = (viewerUser === dm.userA) ? dm.userAAccountId : dm.userBAccountId;
+    const chatId     = (viewerUser === dm.userA) ? dm.userAChatId    : dm.userBChatId;
 
     const msgIds   = await dc.getMessageIds(accountId, chatId);
     const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(accountId, id)))
-      .filter(Boolean).map((msg) => formatDmMessage(msg, dm, username));
+      .filter(Boolean).map((msg) => formatDmMessage(msg, dm, viewerUser));
 
     if (!dm.lastMessage) {
       const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
@@ -1305,18 +1419,8 @@ app.get('/dm/:dm_key/events', (req, res) => {
 
   sseRegister(chatKey, res);
 
-  let accountId = null;
-  if (username) {
-    const info = store.getAccount(username);
-    if (info?.accountId) {
-      accountId = info.accountId;
-      acquireAccountIo(accountId);
-    }
-  }
-
   req.on('close', () => {
     sseUnregister(chatKey, res);
-    if (accountId) releaseAccountIo(accountId);
   });
 });
 
@@ -1486,6 +1590,17 @@ process.on('uncaughtException', (err) => { console.error(err); shutdown(); proce
 async function start() {
   dc.start();
   await ensureBotAccount();
+
+  // Start IO for all already-provisioned user accounts so IMAP stays synced
+  // continuously. This ensures mobile messages are received and Autocrypt keys
+  // are always up-to-date regardless of whether any SSE connection is open.
+  const allAccounts = store.getAllAccounts();
+  for (const [username, info] of Object.entries(allAccounts)) {
+    if (username === '__bot__' || !info?.accountId) continue;
+    dc.rpc.startIo(info.accountId).catch((e) =>
+      console.error(`[startup] startIo(${username}):`, e.message)
+    );
+  }
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);

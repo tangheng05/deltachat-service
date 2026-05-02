@@ -92,6 +92,23 @@ async function main() {
       store.data.directMessages[dmKey] = updated;
       store._save();
 
+      // Bootstrap Autocrypt key exchange so mobile clients can encrypt immediately
+      try {
+        await dc.rpc.startIo(infoA.accountId).catch(() => {});
+        await dc.rpc.startIo(infoB.accountId).catch(() => {});
+        await new Promise((r) => setTimeout(r, 3_000));
+        await Promise.all([
+          dc.sendTextMsg(infoA.accountId, chatIdA, '​'),
+          dc.sendTextMsg(infoB.accountId, chatIdB, '​'),
+        ]);
+        await new Promise((r) => setTimeout(r, 8_000));
+        await dc.rpc.stopIo(infoA.accountId).catch(() => {});
+        await dc.rpc.stopIo(infoB.accountId).catch(() => {});
+        console.log(`  ↻ key exchange bootstrapped`);
+      } catch (ke) {
+        console.warn(`  ⚠ key exchange failed: ${ke.message}`);
+      }
+
       console.log(`  ✓ ${dmKey} (A chatId:${chatIdA}, B chatId:${chatIdB})`);
       migrated++;
     } catch (e) {

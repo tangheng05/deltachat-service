@@ -80,6 +80,7 @@ export class Store {
   // ── Accounts ──────────────────────────────────────────────────────
 
   getAccount(username) { return this.data.accounts[username] ?? null; }
+  getAllAccounts() { return this.data.accounts; }
 
   setAccount(username, info) {
     this.data.accounts[username] = info;
@@ -343,9 +344,15 @@ export class Store {
     this._save();
   }
 
-  findDmKeyByChatId(chatId) {
+  // accountId scopes the lookup so chatId numbers from different accounts don't collide.
+  findDmKeyByChatId(chatId, accountId = null) {
     for (const [key, info] of Object.entries(this.data.directMessages)) {
-      if (info.userAChatId === chatId || info.userBChatId === chatId) return key;
+      if (accountId !== null) {
+        if (info.userAAccountId === accountId && info.userAChatId === chatId) return key;
+        if (info.userBAccountId === accountId && info.userBChatId === chatId) return key;
+      } else {
+        if (info.userAChatId === chatId || info.userBChatId === chatId) return key;
+      }
       if (info.chatId === chatId) return key; // legacy bot-DM fallback
     }
     return null;
