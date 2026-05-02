@@ -129,28 +129,18 @@ async function ensureUserAccount(username) {
   return promise;
 }
 
-// ── Per-account IO lifecycle ─────────────────────────────────────────
-// IO runs only while the user has at least one open SSE connection.
-const accountIoRefs = new Map(); // accountId → refCount
+// ── QR cache ─────────────────────────────────────────────────────────
+// getChatSecurejoinQrCode can be slow (involves network token generation).
+// Cache the result per account; invalidate after 30 minutes so tokens stay fresh.
+const qrCache = new Map(); // accountId → { qr, expiresAt }
+const QR_TTL_MS = 30 * 60 * 1_000;
 
-function acquireAccountIo(accountId) {
-  const count = (accountIoRefs.get(accountId) || 0) + 1;
-  accountIoRefs.set(accountId, count);
-  if (count === 1) {
-    dc.rpc.startIo(accountId).catch((e) =>
-      console.error(`[io] startIo(${accountId}):`, e.message)
-    );
-  }
-}
-
-function releaseAccountIo(accountId) {
-  const count = Math.max(0, (accountIoRefs.get(accountId) || 0) - 1);
-  accountIoRefs.set(accountId, count);
-  if (count === 0) {
-    dc.rpc.stopIo(accountId).catch((e) =>
-      console.error(`[io] stopIo(${accountId}):`, e.message)
-    );
-  }
+async function getQrCached(accountId) {
+  const cached = qrCache.get(accountId);
+  if (cached && cached.expiresAt > Date.now()) return cached.qr;
+  const qr = await dc.rpc.getChatSecurejoinQrCode(accountId, null);
+  qrCache.set(accountId, { qr, expiresAt: Date.now() + QR_TTL_MS });
+  return qr;
 }
 
 // Sends a zero-width-space from each account to the other so both sides'
@@ -159,20 +149,14 @@ function releaseAccountIo(accountId) {
 // encrypted messages — avoiding the "Encryption Needed" chatmail rejection.
 async function bootstrapDmKeys(accountIdA, chatIdA, accountIdB, chatIdB) {
   try {
-    acquireAccountIo(accountIdA);
-    acquireAccountIo(accountIdB);
-    await new Promise((r) => setTimeout(r, 3_000)); // wait for IMAP/SMTP connect
+    // IO is always-on; no acquire/release needed here.
     await Promise.all([
       dc.sendTextMsg(accountIdA, chatIdA, '​'),
       dc.sendTextMsg(accountIdB, chatIdB, '​'),
     ]);
-    await new Promise((r) => setTimeout(r, 12_000)); // wait for SMTP delivery
     console.log(`[dm bootstrap] key exchange sent (A=${accountIdA} B=${accountIdB})`);
   } catch (e) {
     console.error('[dm bootstrap] failed:', e.message);
-  } finally {
-    releaseAccountIo(accountIdA);
-    releaseAccountIo(accountIdB);
   }
 }
 
@@ -410,14 +394,9 @@ app.get('/accounts/:username/qr', async (req, res) => {
   const info = store.getAccount(username);
   if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
   try {
-    acquireAccountIo(info.accountId);
-    await new Promise((r) => setTimeout(r, 1_500));
-    // chatId=null returns a "Setup Contact" invite QR (not group-specific)
-    const qr = await dc.rpc.getChatSecurejoinQrCode(info.accountId, null);
-    releaseAccountIo(info.accountId);
+    const qr = await getQrCached(info.accountId);
     res.json({ qr });
   } catch (e) {
-    releaseAccountIo(info.accountId);
     res.status(500).json({ error: e.message });
   }
 });
@@ -433,10 +412,7 @@ app.get('/accounts/:username/key', async (req, res) => {
   const exportDir = join(tmpdir(), `dc-key-export-${info.accountId}-${Date.now()}`);
   try {
     mkdirSync(exportDir, { recursive: true });
-    acquireAccountIo(info.accountId);
-    await new Promise((r) => setTimeout(r, 1_000));
     await dc.rpc.exportSelfKeys(info.accountId, exportDir, null);
-    releaseAccountIo(info.accountId);
     const files = readdirSync(exportDir);
     const keyFile = files.find((f) => f.endsWith('.asc'));
     if (!keyFile) return res.status(500).json({ error: 'Key export produced no file' });
@@ -445,7 +421,6 @@ app.get('/accounts/:username/key', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${username}-private-key.asc"`);
     res.send(keyData);
   } catch (e) {
-    releaseAccountIo(info.accountId);
     res.status(500).json({ error: e.message });
   } finally {
     try { rmSync(exportDir, { recursive: true, force: true }); } catch {}
@@ -1601,6 +1576,12 @@ async function start() {
       console.error(`[startup] startIo(${username}):`, e.message)
     );
   }
+
+  // Nudge the DC core every 60s to keep IMAP IDLE connections alive so
+  // Securejoin handshakes and incoming messages aren't delayed.
+  setInterval(() => {
+    dc.rpc.maybeNetwork().catch(() => {});
+  }, 60_000);
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);
