@@ -337,11 +337,50 @@ export class Store {
 
   // ── Direct Messages ───────────────────────────────────────────────
 
+  _dmDedupeKey(msg) {
+    if (msg?.id != null) return `id:${msg.id}`;
+    const sender = msg?.senderUsername ?? '';
+    const ts = msg?.timestamp ?? 0;
+    const text = msg?.text ?? '';
+    return `${sender}|${ts}|${text}`;
+  }
+
   getDm(dmKey) { return this.data.directMessages[dmKey] ?? null; }
 
   setDm(dmKey, info) {
     this.data.directMessages[dmKey] = info;
     this._save();
+  }
+
+  addDmMessage(dmKey, msg) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm || !msg) return;
+    dm.messageCache ??= [];
+    const key = this._dmDedupeKey(msg);
+    if (dm.messageCache.some((m) => m._dedupeKey === key)) return;
+    dm.messageCache.push({ ...msg, _dedupeKey: key });
+    const max = 500;
+    if (dm.messageCache.length > max) dm.messageCache.splice(0, dm.messageCache.length - max);
+    this._save();
+  }
+
+  replaceDmMessageId(dmKey, localId, realId) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm?.messageCache?.length) return;
+    const idx = dm.messageCache.findIndex((m) => m.id === localId);
+    if (idx === -1) return;
+    const updated = { ...dm.messageCache[idx], id: realId };
+    updated._dedupeKey = this._dmDedupeKey(updated);
+    dm.messageCache[idx] = updated;
+    // Drop any other cached item that now shares the same dedupe key.
+    dm.messageCache = dm.messageCache.filter((m, i) => i === idx || m._dedupeKey !== updated._dedupeKey);
+    this._save();
+  }
+
+  getDmCachedMessages(dmKey) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm?.messageCache) return [];
+    return dm.messageCache.map(({ _dedupeKey, ...rest }) => rest);
   }
 
   // accountId scopes the lookup so chatId numbers from different accounts don't collide.

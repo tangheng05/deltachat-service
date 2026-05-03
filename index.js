@@ -135,34 +135,193 @@ async function ensureUserAccount(username) {
 const qrCache = new Map(); // accountId → { qr, expiresAt }
 const QR_TTL_MS = 30 * 60 * 1_000;
 
+const _qrInFlight = new Map(); // accountId → Promise
+
 async function getQrCached(accountId) {
   const cached = qrCache.get(accountId);
   if (cached && cached.expiresAt > Date.now()) return cached.qr;
-  const qr = await dc.rpc.getChatSecurejoinQrCode(accountId, null);
-  qrCache.set(accountId, { qr, expiresAt: Date.now() + QR_TTL_MS });
-  return qr;
+  if (_qrInFlight.has(accountId)) return _qrInFlight.get(accountId);
+  const promise = (async () => {
+    try {
+      await dc.rpc.startIo(accountId).catch(() => {});
+      const qr = await withTimeout(dc.rpc.getChatSecurejoinQrCode(accountId, null), 30_000, 'getChatSecurejoinQrCode');
+      qrCache.set(accountId, { qr, expiresAt: Date.now() + QR_TTL_MS });
+      ioSendLinger(accountId); // stop IO after 45s so chatmail can push to mobile
+      return qr;
+    } finally {
+      _qrInFlight.delete(accountId);
+    }
+  })();
+  _qrInFlight.set(accountId, promise);
+  return promise;
 }
 
-// Sends a zero-width-space from each account to the other so both sides'
-// Autocrypt keys land in each other's IMAP inbox. When a mobile user logs in
-// and syncs, DC picks up the key from this message and can immediately send
-// encrypted messages — avoiding the "Encryption Needed" chatmail rejection.
-async function bootstrapDmKeys(accountIdA, chatIdA, accountIdB, chatIdB) {
-  try {
-    // IO is always-on; no acquire/release needed here.
-    await Promise.all([
-      dc.sendTextMsg(accountIdA, chatIdA, '​'),
-      dc.sendTextMsg(accountIdB, chatIdB, '​'),
-    ]);
-    console.log(`[dm bootstrap] key exchange sent (A=${accountIdA} B=${accountIdB})`);
-  } catch (e) {
-    console.error('[dm bootstrap] failed:', e.message);
+function addDmChatId(dm, side, chatId) {
+  if (!dm || !chatId) return dm;
+  const primaryKey = side === 'A' ? 'userAChatId' : 'userBChatId';
+  const listKey = side === 'A' ? 'userAChatIds' : 'userBChatIds';
+  const list = Array.isArray(dm[listKey]) ? dm[listKey] : [];
+  const merged = new Set(list);
+  if (dm[primaryKey]) merged.add(dm[primaryKey]);
+  merged.add(chatId);
+  return { ...dm, [primaryKey]: chatId, [listKey]: [...merged] };
+}
+
+// Resolve the canonical chatId for a DM participant by looking up the contact
+// address. DC may create a different chatId for the first incoming message
+// (contact-request chat) vs the provisioned one. Updates the store in-place.
+async function resolveCanonicalChatId(accountId, otherAddr, dmKey, isUserA) {
+  const contactId = await withTimeout(
+    dc.lookupContactIdByAddr(accountId, otherAddr), 8_000, 'lookupContactIdByAddr'
+  ).catch(() => 0);
+  if (!contactId) return 0;
+  const resolved = await withTimeout(
+    dc.createChatByContactId(accountId, contactId), 8_000, 'createChatByContactId'
+  ).catch(() => 0);
+  if (!resolved) return 0;
+  const dm = store.getDm(dmKey);
+  if (dm) {
+    const updated = addDmChatId(dm, isUserA ? 'A' : 'B', resolved);
+    if (updated !== dm) store.setDm(dmKey, updated);
+  }
+  return resolved;
+}
+
+// Uses DC securejoin to exchange Autocrypt keys between two per-user accounts.
+// secureJoin is chatmail-compatible; plain messages fail until keys are exchanged.
+// Deduplicated per dmKey — only one in-flight bootstrap at a time per DM pair.
+const _bootstrapInFlight = new Map(); // dmKey → Promise
+
+function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
+  if (_bootstrapInFlight.has(dmKey)) return _bootstrapInFlight.get(dmKey);
+  const promise = (async () => {
+    try {
+      // Both accounts need IO for the securejoin handshake
+      await Promise.all([
+        dc.rpc.startIo(accountIdA).catch(() => {}),
+        dc.rpc.startIo(accountIdB).catch(() => {}),
+      ]);
+      const qr = await withTimeout(
+        dc.rpc.getChatSecurejoinQrCode(accountIdB, null), 30_000, 'bootstrap/getQr'
+      );
+      const chatIdInA = await withTimeout(
+        dc.rpc.secureJoin(accountIdA, qr), 60_000, 'bootstrap/secureJoin'
+      );
+      const dm = store.getDm(dmKey);
+      if (dm) {
+        const isA = dm.userAAccountId === accountIdA;
+        let update = { ...dm, securejoinDone: true };
+        // Set A's chatId (returned by secureJoin)
+        if (chatIdInA) update = addDmChatId(update, isA ? 'A' : 'B', chatIdInA);
+        // Also resolve B's chatId so B can read messages without waiting for IncomingMsg
+        const addrA = store.getAccount(isA ? dm.userA : dm.userB)?.addr;
+        if (addrA) {
+          const chatIdInB = await resolveCanonicalChatId(accountIdB, addrA, dmKey, !isA).catch(() => 0);
+          if (chatIdInB) update = addDmChatId(update, isA ? 'B' : 'A', chatIdInB);
+        }
+        store.setDm(dmKey, update);
+        console.log(`[dm bootstrap] securejoin done for ${dmKey}`);
+      }
+      // B's IO was started only for this bootstrap; linger it so chatmail can push to B's mobile
+      ioSendLinger(accountIdB);
+    } catch (e) {
+      console.error('[dm bootstrap] securejoin failed:', e.message);
+      ioSendLinger(accountIdB);
+    } finally {
+      _bootstrapInFlight.delete(dmKey);
+    }
+  })();
+  _bootstrapInFlight.set(dmKey, promise);
+  return promise;
+}
+
+// ── Per-user IO lifecycle ────────────────────────────────────────────
+// Per-user DC accounts must NOT have IMAP running permanently.
+// Chatmail only sends push notifications to mobile DC when no other IMAP
+// client is actively polling the same inbox. If we keep IO alive for all
+// accounts, the server consumes every new-message notification and mobile
+// never gets a push — forcing the user to open DC to receive messages.
+//
+// Rule: IO is only alive when a web SSE client has that DM open.
+// The send path starts IO transiently; it stops via the linger timer once
+// no SSE client is watching.
+
+const ioRefs = new Map();     // accountId → active SSE ref count
+const ioLingers = new Map();  // accountId → setTimeout handle
+const IO_LINGER_MS = 45_000;  // keep IO alive 45s after last SSE client leaves
+
+function ioAcquire(accountId) {
+  if (!accountId) return;
+  clearTimeout(ioLingers.get(accountId));
+  ioLingers.delete(accountId);
+  ioRefs.set(accountId, (ioRefs.get(accountId) || 0) + 1);
+  dc.rpc.startIo(accountId).catch((e) =>
+    console.warn(`[io] startIo failed for ${accountId}:`, e.message)
+  );
+}
+
+function ioRelease(accountId) {
+  if (!accountId) return;
+  const refs = Math.max(0, (ioRefs.get(accountId) || 0) - 1);
+  ioRefs.set(accountId, refs);
+  if (refs > 0) return;
+  // Linger so quick SSE reconnects and pending SMTP deliveries don't stall.
+  const t = setTimeout(() => {
+    ioLingers.delete(accountId);
+    if ((ioRefs.get(accountId) || 0) === 0) {
+      dc.rpc.stopIo(accountId).catch(() => {});
+      console.log(`[io] stopped IO for account ${accountId} (no SSE refs)`);
+    }
+  }, IO_LINGER_MS);
+  ioLingers.set(accountId, t);
+}
+
+// Bump the linger timer for a send — keeps IO alive long enough for SMTP
+// delivery even when no SSE client is watching.
+function ioSendLinger(accountId) {
+  if (!accountId) return;
+  if ((ioRefs.get(accountId) || 0) > 0) return; // SSE already holds it
+  clearTimeout(ioLingers.get(accountId));
+  const t = setTimeout(() => {
+    ioLingers.delete(accountId);
+    if ((ioRefs.get(accountId) || 0) === 0) {
+      dc.rpc.stopIo(accountId).catch(() => {});
+    }
+  }, IO_LINGER_MS);
+  ioLingers.set(accountId, t);
+}
+
+function startAllUserIo() {
+  // Only the bot account needs always-on IO (order/community chats).
+  // Per-user accounts are managed by ioAcquire/ioRelease above.
+  if (botAccountId) {
+    dc.rpc.startIo(botAccountId).catch((e) =>
+      console.warn('[startAllUserIo] bot startIo failed:', e.message)
+    );
   }
 }
 
 // ── SSE registry ────────────────────────────────────────────────────
 // chatKey: "order:<id>" | "community:<id>" | "dm:<dmKey>" | "shopinbox:<id>"
 const sseClients = new Map();
+
+const recentOutgoingMsgIds = new Map();
+const OUTGOING_TTL_MS = 60_000;
+
+function markOutgoing(accountId, msgId) {
+  if (!accountId || !msgId) return;
+  recentOutgoingMsgIds.set(`${accountId}:${msgId}`, Date.now());
+}
+
+function isRecentOutgoing(accountId, msgId) {
+  if (!accountId || !msgId) return false;
+  const key = `${accountId}:${msgId}`;
+  const now = Date.now();
+  for (const [k, ts] of recentOutgoingMsgIds) {
+    if (now - ts > OUTGOING_TTL_MS) recentOutgoingMsgIds.delete(k);
+  }
+  return recentOutgoingMsgIds.has(key);
+}
 
 function sseRegister(chatKey, res) {
   if (!sseClients.has(chatKey)) sseClients.set(chatKey, new Set());
@@ -211,12 +370,16 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
         if (!existingDm) {
           const receiverInfo = store.getAccount(receiverUser);
+          const userAChatId = u1 === receiverUser ? chatId : null;
+          const userBChatId = u2 === receiverUser ? chatId : null;
           store.setDm(dmKey, {
             userA: u1, userB: u2,
             userAAccountId: u1 === receiverUser ? receiverInfo.accountId : null,
-            userAChatId:    u1 === receiverUser ? chatId : null,
+            userAChatId,
             userBAccountId: u2 === receiverUser ? receiverInfo.accountId : null,
-            userBChatId:    u2 === receiverUser ? chatId : null,
+            userBChatId,
+            userAChatIds: userAChatId ? [userAChatId] : [],
+            userBChatIds: userBChatId ? [userBChatId] : [],
             createdAt: Date.now(),
           });
           console.log(`[IncomingMsg] auto-created DM for mobile sender ${senderAddr} → ${dmKey}`);
@@ -227,9 +390,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
           const isUserA = existingDm.userAAccountId === contextId;
           const storedChatId = isUserA ? existingDm.userAChatId : existingDm.userBChatId;
           if (storedChatId !== chatId) {
-            const update = isUserA
-              ? { ...existingDm, userAChatId: chatId }
-              : { ...existingDm, userBChatId: chatId };
+            const update = addDmChatId(existingDm, isUserA ? 'A' : 'B', chatId);
             store.setDm(dmKey, update);
             console.log(`[IncomingMsg] updated ${isUserA ? 'userA' : 'userB'} chatId ${storedChatId}→${chatId} for ${dmKey}`);
           }
@@ -251,6 +412,8 @@ dc.on('IncomingMsg', async (contextId, event) => {
     if (!msg.text || msg.text === '​') return;
     if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => msg.text.toLowerCase().includes(s))) return;
 
+    if (dmKey && isRecentOutgoing(contextId, msgId)) return;
+
     let formatted;
     if (dmKey) {
       const dm = store.getDm(dmKey);
@@ -265,6 +428,10 @@ dc.on('IncomingMsg', async (contextId, event) => {
     }
 
     sseBroadcast(chatKey, formatted);
+
+    if (dmKey && formatted && !formatted.isSystem) {
+      store.addDmMessage(dmKey, formatted);
+    }
 
     if (orderId) {
       const shopMatch = String(orderId).match(/^shop_(\d+)_/);
@@ -341,6 +508,26 @@ function formatDmMessage(msg, dm, viewerUsername) {
     chatId: msg.chatId,
     replyTo,
   };
+}
+
+function dmMessageKey(msg) {
+  const sender = msg?.senderUsername ?? '';
+  const ts = msg?.timestamp ?? 0;
+  const text = msg?.text ?? '';
+  return `${sender}|${ts}|${text}`;
+}
+
+function mergeDmMessages(dcMessages, cachedMessages) {
+  const byKey = new Map();
+  for (const msg of cachedMessages || []) {
+    byKey.set(dmMessageKey(msg), msg);
+  }
+  for (const msg of dcMessages || []) {
+    const key = dmMessageKey(msg);
+    const existing = byKey.get(key);
+    if (!existing || (!existing.id && msg.id)) byKey.set(key, msg);
+  }
+  return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
 
 const rand = (bytes) => randomBytes(bytes).toString('hex');
@@ -1263,15 +1450,17 @@ app.post('/dm', async (req, res) => {
         userA: u1, userB: u2,
         userAAccountId: infoA.accountId, userAChatId: chatIdA,
         userBAccountId: infoB.accountId, userBChatId: chatIdB,
+        userAChatIds: chatIdA ? [chatIdA] : [],
+        userBChatIds: chatIdB ? [chatIdB] : [],
         createdAt: Date.now(), keyExchangeSent: true,
       };
       store.setDm(dmKey, dm);
       console.log(`[dm] created per-user DM — dmKey=${dmKey}`);
-      bootstrapDmKeys(infoA.accountId, chatIdA, infoB.accountId, chatIdB);
-    } else if (dm.userAAccountId && !dm.keyExchangeSent) {
-      // Existing DM that pre-dates the bootstrap — send it now
-      bootstrapDmKeys(dm.userAAccountId, dm.userAChatId, dm.userBAccountId, dm.userBChatId);
-      store.setDm(dmKey, { ...dm, keyExchangeSent: true });
+      bootstrapDmKeys(dmKey, infoA.accountId, infoB.accountId);
+    } else if (dm.userAAccountId && !dm.securejoinDone) {
+      // Runs securejoin for any DM that hasn't completed it yet, including ones
+      // that used the old ZWS bootstrap (which fails on chatmail).
+      bootstrapDmKeys(dmKey, dm.userAAccountId, dm.userBAccountId);
     }
 
     res.json({ dmKey, userA: dm.userA, userB: dm.userB });
@@ -1312,10 +1501,15 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       const botId = await ensureBotAccount();
       sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
       store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
+      store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
       res.json({ msgId: localId });
       const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
       dc.sendTextMsg(botId, dm.chatId, `💬 DM (${sender_username}): ${text}`, replyToId)
-        .then((realId) => sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId }))
+        .then((realId) => {
+          store.replaceDmMessageId(dm_key, localId, realId);
+          markOutgoing(botId, realId);
+          sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
+        })
         .catch((e) => console.error('[/dm/send legacy]', e.message));
       return;
     }
@@ -1326,12 +1520,75 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
 
     sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
     store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
+    store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
     res.json({ msgId: localId });
 
     const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
-    dc.sendTextMsg(senderInfo.accountId, senderInfo.chatId, text, replyToId)
-      .then((realId) => sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId }))
-      .catch((e) => console.error('[/dm/:key/send]', e.message));
+    const recipientUser = dm.userA === sender_username ? dm.userB : dm.userA;
+    const recipientInfo = store.getAccount(recipientUser);
+    (async () => {
+      // Await startIo so IO is confirmed running before sendTextMsg queues the
+      // message — otherwise a cold account leaves the message in the outbox for
+      // up to startAllUserIo interval before SMTP delivery begins.
+      await dc.rpc.startIo(senderInfo.accountId).catch((e) => {
+        console.warn('[/dm/:key/send] startIo sender failed:', e.message);
+      });
+      // Retry securejoin if it never completed — chatmail silently drops
+      // unencrypted messages, so a failed/pending bootstrap means delivery
+      // fails even though sendTextMsg returns a message ID.
+      if (!dm.securejoinDone && recipientInfo?.accountId) {
+        bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
+      }
+      const isUserA = dm.userA === sender_username;
+      // Always resolve the canonical chatId when possible. Chat IDs are local
+      // per device; switching to mobile can create a new chatId in this DB.
+      const canonical = (recipientInfo?.addr && senderInfo?.accountId)
+        ? await resolveCanonicalChatId(senderInfo.accountId, recipientInfo.addr, dm_key, isUserA)
+        : 0;
+      const sendChatId = canonical || senderInfo.chatId;
+      if (!sendChatId) {
+        console.error('[/dm/:key/send] no valid chatId for', dm_key, sender_username);
+        sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
+        return;
+      }
+      // Keep sender IO alive for the linger window so SMTP delivery
+      // completes even if there is no SSE client holding a ref.
+      ioSendLinger(senderInfo.accountId);
+      try {
+        const realId = await dc.sendTextMsg(senderInfo.accountId, sendChatId, text, replyToId);
+        store.replaceDmMessageId(dm_key, localId, realId);
+        markOutgoing(senderInfo.accountId, realId);
+        sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
+      } catch (e) {
+        console.error('[/dm/:key/send]', e.message);
+        // Common failure when securejoin/Autocrypt keys are missing. Attempt
+        // one bootstrap + retry when the RPC reports a missing key for this chat.
+        const emsg = String(e.message || '').toLowerCase();
+        if (emsg.includes('key is missing') || emsg.includes('cannot send to chat#')) {
+          try {
+            console.log(`[/dm/:key/send] key missing; attempting securejoin for ${dm_key}`);
+            await bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
+            // Re-resolve chat id after bootstrap and try once more.
+            const retryCanonical = ((!dm.securejoinDone || !senderInfo.chatId) && recipientInfo?.addr)
+              ? await resolveCanonicalChatId(senderInfo.accountId, recipientInfo.addr, dm_key, isUserA)
+              : 0;
+            const refreshedDm = store.getDm(dm_key) || dm;
+            const refreshedSenderInfo = store.getDmAccountAndChat(dm_key, sender_username) || senderInfo;
+            const retrySendChatId = retryCanonical || refreshedSenderInfo.chatId || 0;
+            if (retrySendChatId) {
+              const realId2 = await dc.sendTextMsg(senderInfo.accountId, retrySendChatId, text, replyToId);
+              store.replaceDmMessageId(dm_key, localId, realId2);
+              markOutgoing(senderInfo.accountId, realId2);
+              sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId: realId2 });
+              return;
+            }
+          } catch (e2) {
+            console.error('[/dm/:key/send retry]', e2.message);
+          }
+        }
+        sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
+      }
+    })();
   } catch (e) {
     console.error('[/dm/:key/send]', e.message);
     if (!res.headersSent) res.status(500).json({ error: e.message });
@@ -1362,18 +1619,49 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     // Per-user: read from the requesting user's side
     const viewerUser = (username === dm.userA) ? dm.userA : dm.userB;
     const accountId  = (viewerUser === dm.userA) ? dm.userAAccountId : dm.userBAccountId;
-    const chatId     = (viewerUser === dm.userA) ? dm.userAChatId    : dm.userBChatId;
+    let   chatId     = (viewerUser === dm.userA) ? dm.userAChatId    : dm.userBChatId;
 
-    const msgIds   = await dc.getMessageIds(accountId, chatId);
+    // Wake IO for the viewer so IMAP syncs and messages appear.
+    // ioSendLinger schedules the stop; startIo actually starts it if not running.
+    if (accountId) {
+      dc.rpc.startIo(accountId).catch(() => {});
+      ioSendLinger(accountId);
+    }
+
+    const otherUser = viewerUser === dm.userA ? dm.userB : dm.userA;
+    const otherInfo = store.getAccount(otherUser);
+    const isViewerA = viewerUser === dm.userA;
+    // Always resolve canonical chatId when possible so web stays in sync with
+    // mobile devices (chatId is local to each client DB).
+    const resolved = (otherInfo?.addr && accountId)
+      ? await resolveCanonicalChatId(accountId, otherInfo.addr, dm_key, isViewerA)
+      : 0;
+    if (resolved && resolved !== chatId) {
+      console.log(`[messages] chatId mismatch ${dm_key}/${viewerUser}: ${chatId}→${resolved} — healing`);
+      chatId = resolved;
+    }
+    const canonicalChatId = resolved || chatId;
+    const listKey = isViewerA ? 'userAChatIds' : 'userBChatIds';
+    const storedList = Array.isArray(dm[listKey]) ? dm[listKey] : [];
+
+    // Collect from all known chatIds to cover the split-chat case
+    const chatIds = [...new Set([chatId, canonicalChatId, ...storedList].filter((cid) => cid))];
+    const idSets = await Promise.all(
+      chatIds.map((cid) => dc.getMessageIds(accountId, cid).catch(() => []))
+    );
+    const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
     const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(accountId, id)))
       .filter(Boolean).map((msg) => formatDmMessage(msg, dm, viewerUser));
 
+    const cachedMessages = store.getDmCachedMessages(dm_key);
+    const mergedMessages = mergeDmMessages(messages, cachedMessages);
+
     if (!dm.lastMessage) {
-      const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
+      const last = [...mergedMessages].reverse().find((m) => m.text && !m.isSystem);
       if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
     }
 
-    res.json({ messages, lastSeenBy: dm.lastSeenBy || {} });
+    res.json({ messages: mergedMessages, lastSeenBy: dm.lastSeenBy || {} });
   } catch (e) {
     console.error('[/dm/:key/messages]', e.message);
     res.status(500).json({ error: e.message });
@@ -1394,8 +1682,29 @@ app.get('/dm/:dm_key/events', (req, res) => {
 
   sseRegister(chatKey, res);
 
+  // Acquire IO only for the web viewer's own account.
+  // The OTHER participant is on mobile — their account must NOT have
+  // server IO running or chatmail skips sending push to their device.
+  const dm = store.getDm(dm_key);
+  const viewerAccountId = dm
+    ? (username === dm.userA ? dm.userAAccountId : dm.userBAccountId)
+    : null;
+  ioAcquire(viewerAccountId);
+
+  if (dm?.userAAccountId && dm?.userBAccountId && !dm.securejoinDone) {
+    bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
+  }
+
+  // Keepalive ping every 15s — prevents browsers and proxies from silently
+  // dropping idle EventSource connections (the root cause of missed messages).
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
+  }, 15_000);
+
   req.on('close', () => {
+    clearInterval(heartbeat);
     sseUnregister(chatKey, res);
+    ioRelease(viewerAccountId);
   });
 });
 
@@ -1551,6 +1860,14 @@ app.delete('/dm/:dm_key', async (req, res) => {
 // ── GET /dm/user/:username ────────────────────────────────────────────
 app.get('/dm/user/:username', (req, res) => {
   const { username } = req.params;
+  // The messages page calls this every 30s. Use it as a presence heartbeat:
+  // keep the user's account IO alive so IncomingMsg fires while they're online.
+  // IO stops 45s after they leave (linger > polling interval = no gap).
+  const info = store.getAccount(username);
+  if (info?.accountId) {
+    dc.rpc.startIo(info.accountId).catch(() => {});
+    ioSendLinger(info.accountId);
+  }
   res.json({ dms: store.getDmsForUser(username) });
 });
 
@@ -1566,22 +1883,9 @@ async function start() {
   dc.start();
   await ensureBotAccount();
 
-  // Start IO for all already-provisioned user accounts so IMAP stays synced
-  // continuously. This ensures mobile messages are received and Autocrypt keys
-  // are always up-to-date regardless of whether any SSE connection is open.
-  const allAccounts = store.getAllAccounts();
-  for (const [username, info] of Object.entries(allAccounts)) {
-    if (username === '__bot__' || !info?.accountId) continue;
-    dc.rpc.startIo(info.accountId).catch((e) =>
-      console.error(`[startup] startIo(${username}):`, e.message)
-    );
-  }
-
-  // Nudge the DC core every 60s to keep IMAP IDLE connections alive so
-  // Securejoin handshakes and incoming messages aren't delayed.
-  setInterval(() => {
-    dc.rpc.maybeNetwork().catch(() => {});
-  }, 60_000);
+  startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
+  setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000);
+  setInterval(startAllUserIo, 30_000); // bot keepalive only
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);

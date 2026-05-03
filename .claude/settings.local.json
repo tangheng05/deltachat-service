@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --input-type=module --eval ' *)",
+      "Bash(node --check index.js)",
+      "Bash(node --check migrate-dms.js)"
+    ]
+  }
+}
