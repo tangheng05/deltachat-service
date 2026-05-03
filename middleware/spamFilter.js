@@ -22,15 +22,18 @@ export function spamFilter(req, res, next) {
     return res.status(400).json({ error: `Message exceeds ${MAX_MSG_LENGTH} character limit` });
   }
 
+  const chatContext = req.params.dm_key || req.params.community_id || req.params.order_id || 'global';
+  const dedupKey = `${sender_username}:${chatContext}`;
+
   const now = Date.now();
   const cutoff = now - DUPLICATE_WINDOW_MS;
-  const recent = (recentMsgsMap.get(sender_username) || []).filter((e) => e.ts > cutoff);
+  const recent = (recentMsgsMap.get(dedupKey) || []).filter((e) => e.ts > cutoff);
 
   if (recent.length >= DUPLICATE_THRESHOLD && recent.every((e) => e.text === text)) {
     return res.status(429).json({ error: 'Duplicate message' });
   }
 
   recent.push({ text, ts: now });
-  recentMsgsMap.set(sender_username, recent);
+  recentMsgsMap.set(dedupKey, recent);
   next();
 }

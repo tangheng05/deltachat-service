@@ -14,6 +14,7 @@ import { spamFilter } from './middleware/spamFilter.js';
 import { blockCheck } from './middleware/blockCheck.js';
 import { groupGuard } from './middleware/groupGuard.js';
 import { requireRole } from './middleware/requireRole.js';
+import { internalAuth } from './middleware/internalAuth.js';
 
 // ── Config ──────────────────────────────────────────────────────────
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -107,13 +108,31 @@ async function ensureUserAccount(username) {
   const promise = (async () => {
     try {
       const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
-      await withTimeout(
-        dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`),
-        20_000, 'setConfigFromQr'
-      );
-      await dc.setConfig(accountId, 'displayname', username);
-      await withTimeout(dc.configure(accountId), 30_000, 'configure');
-      // configure() starts IO; keep it running so IMAP stays synced always.
+
+      // Try username-based address first (hengthegoat@chat.domain).
+      // Chatmail creates the account on first connect if it doesn't exist yet.
+      const desiredAddr = `${username.toLowerCase()}@${CHATMAIL_DOMAIN}`;
+      const desiredPw   = rand(16);
+      let configured = false;
+      try {
+        await dc.setConfig(accountId, 'addr', desiredAddr);
+        await dc.setConfig(accountId, 'mail_pw', desiredPw);
+        await dc.setConfig(accountId, 'displayname', username);
+        await withTimeout(dc.configure(accountId), 30_000, 'configure');
+        configured = true;
+      } catch (e) {
+        console.warn(`[user-account] username addr failed for ${desiredAddr}, falling back to QR: ${e.message}`);
+      }
+
+      if (!configured) {
+        await withTimeout(
+          dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`),
+          20_000, 'setConfigFromQr'
+        );
+        await dc.setConfig(accountId, 'displayname', username);
+        await withTimeout(dc.configure(accountId), 30_000, 'configure (qr fallback)');
+      }
+
       const addr     = await dc.getConfig(accountId, 'addr');
       const password = await dc.getConfig(accountId, 'mail_pw');
       const info = { accountId, addr, password };
@@ -308,6 +327,13 @@ const sseClients = new Map();
 const recentOutgoingMsgIds = new Map();
 const OUTGOING_TTL_MS = 60_000;
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, ts] of recentOutgoingMsgIds) {
+    if (now - ts > OUTGOING_TTL_MS) recentOutgoingMsgIds.delete(k);
+  }
+}, 60_000).unref();
+
 function markOutgoing(accountId, msgId) {
   if (!accountId || !msgId) return;
   recentOutgoingMsgIds.set(`${accountId}:${msgId}`, Date.now());
@@ -346,6 +372,7 @@ function sseBroadcast(chatKey, payload) {
 
 // ── DC event listener ────────────────────────────────────────────────
 dc.on('IncomingMsg', async (contextId, event) => {
+  try {
   const { chatId, msgId } = event;
 
   const orderId     = store.findOrderIdByChatId(chatId);
@@ -441,6 +468,9 @@ dc.on('IncomingMsg', async (contextId, event) => {
     }
   } catch (e) {
     console.error('[IncomingMsg] failed to fetch message:', e.message);
+  }
+  } catch (e) {
+    console.error('[IncomingMsg] unhandled error:', e.message);
   }
 });
 
@@ -562,10 +592,13 @@ app.use((req, res, next) => {
 // ── GET /health ───────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', domain: CHATMAIL_DOMAIN }));
 
+const USERNAME_RE = /^[\w.-]{1,64}$/;
+
 // ── POST /accounts ────────────────────────────────────────────────────
 app.post('/accounts', async (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'username required' });
+  if (!USERNAME_RE.test(username)) return res.status(400).json({ error: 'Invalid username' });
   try {
     const info = await ensureUserAccount(username);
     res.json({ username, addr: info.addr });
@@ -600,7 +633,7 @@ app.get('/accounts/:username/qr', async (req, res) => {
 // Exports the account's PGP private key as an .asc file so the user can
 // import it into DC mobile (Settings → Import Keys) to share the same
 // encryption identity as the web account.
-app.get('/accounts/:username/key', async (req, res) => {
+app.get('/accounts/:username/key', internalAuth, async (req, res) => {
   const { username } = req.params;
   const info = store.getAccount(username);
   if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
@@ -1432,6 +1465,7 @@ app.get('/moderation/blocks/:username', (req, res) => {
 app.post('/dm', async (req, res) => {
   const { user_a, user_b } = req.body;
   if (!user_a || !user_b) return res.status(400).json({ error: 'user_a and user_b required' });
+  if (!USERNAME_RE.test(user_a) || !USERNAME_RE.test(user_b)) return res.status(400).json({ error: 'Invalid username' });
   if (user_a === user_b) return res.status(400).json({ error: 'Cannot DM yourself' });
 
   const [u1, u2] = [user_a, user_b].sort();
@@ -1892,8 +1926,8 @@ async function start() {
   await ensureBotAccount();
 
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
-  setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000);
-  setInterval(startAllUserIo, 30_000); // bot keepalive only
+  setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
+  setInterval(startAllUserIo, 30_000).unref(); // bot keepalive only
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);

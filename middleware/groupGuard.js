@@ -12,6 +12,12 @@ export function groupGuard(store, req, res, next) {
   const mutes = group.mutes ?? {};
   const roles = group.roles ?? {};
 
+  const members = group.memberUsernames ?? [];
+  const hasRole  = (roles)[sender_username];
+  if (!hasRole && !members.includes(sender_username)) {
+    return res.status(403).json({ error: 'You are not a member of this group' });
+  }
+
   if (bans[sender_username]) {
     return res.status(403).json({ error: 'You are banned from this group' });
   }

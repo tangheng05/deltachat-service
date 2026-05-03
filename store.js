@@ -63,13 +63,13 @@ export class Store {
       const tmp = this.filePath + '.tmp';
       const data = JSON.stringify(this.data, null, 2);
       writeFile(tmp, data, (err) => {
-        if (!err) rename(tmp, this.filePath, () => {});
+        if (err) { console.error('[store] write error:', err.message); return; }
+        rename(tmp, this.filePath, (e) => { if (e) console.error('[store] rename error:', e.message); });
       });
     }, 100);
   }
 
   flush() {
-    if (!this._saveTimer) return;
     clearTimeout(this._saveTimer);
     this._saveTimer = null;
     const tmp = this.filePath + '.tmp';
