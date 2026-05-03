@@ -524,6 +524,14 @@ function mergeDmMessages(dcMessages, cachedMessages) {
   }
   for (const msg of dcMessages || []) {
     const key = dmMessageKey(msg);
+    // If this DC message's id already exists under a different key (timestamp
+    // drift between the cache entry and the DC-assigned timestamp), evict the
+    // stale cached entry so we don't end up with two copies of the same message.
+    if (msg.id != null && !byKey.has(key)) {
+      for (const [k, m] of byKey) {
+        if (m.id === msg.id) { byKey.delete(k); break; }
+      }
+    }
     const existing = byKey.get(key);
     if (!existing || (!existing.id && msg.id)) byKey.set(key, msg);
   }
@@ -1533,11 +1541,11 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       await dc.rpc.startIo(senderInfo.accountId).catch((e) => {
         console.warn('[/dm/:key/send] startIo sender failed:', e.message);
       });
-      // Retry securejoin if it never completed — chatmail silently drops
-      // unencrypted messages, so a failed/pending bootstrap means delivery
-      // fails even though sendTextMsg returns a message ID.
+      // Await bootstrap before sending — chatmail silently drops unencrypted
+      // messages with no error, so fire-and-forget causes the first message to
+      // vanish. res.json is already sent, so this wait is invisible to the user.
       if (!dm.securejoinDone && recipientInfo?.accountId) {
-        bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
+        await bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId).catch(() => {});
       }
       const isUserA = dm.userA === sender_username;
       // Always resolve the canonical chatId when possible. Chat IDs are local
