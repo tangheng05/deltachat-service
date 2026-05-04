@@ -6,7 +6,12 @@
  * Upgrades every bot-DM record in store.json to the per-user format:
  *   { chatId } → { userAAccountId, userAChatId, userBAccountId, userBChatId }
  *
- * Safe to re-run — skips records that are already migrated.
+ * Each user gets a named email derived from their username:
+ *   hengthegoat     → hengthegoat@chat.serey.io
+ *   puthichenda-lor → puthichendalor@chat.serey.io   (special chars stripped)
+ *
+ * Safe to re-run — skips DM records that are already migrated and skips
+ * users that already have an accountId in the store.
  */
 
 import 'dotenv/config';
@@ -29,10 +34,10 @@ const withTimeout = (p, ms) =>
   Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error(`timed out after ${ms}ms`)), ms))]);
 
 async function provisionUser(username) {
-  let info = store.getAccount(username);
-  if (info?.accountId) {
-    console.log(`  [skip provision] ${username} already has accountId=${info.accountId}`);
-    return info;
+  const cached = store.getAccount(username);
+  if (cached?.accountId) {
+    console.log(`  [skip provision] ${username} already has accountId=${cached.accountId}`);
+    return cached;
   }
 
   console.log(`  [provision] ${username}...`);
@@ -44,15 +49,14 @@ async function provisionUser(username) {
 
   const addr     = await dc.getConfig(accountId, 'addr');
   const password = await dc.getConfig(accountId, 'mail_pw');
-  const info2    = { accountId, addr, password };
-  store.setAccount(username, info2);
+  const info = { accountId, addr, password };
+  store.setAccount(username, info);
   console.log(`  → ${username} = ${addr} (accountId=${accountId})`);
-  return info2;
+  return info;
 }
 
 async function main() {
   dc.start();
-  // Give the RPC subprocess a moment to initialise
   await new Promise((r) => setTimeout(r, 2000));
 
   const dms = Object.entries(store.data.directMessages);
@@ -81,7 +85,6 @@ async function main() {
       const chatIdA    = await dc.createChatByContactId(infoA.accountId, contactInA);
       const chatIdB    = await dc.createChatByContactId(infoB.accountId, contactInB);
 
-      // Build updated record — remove old chatId, add per-user fields
       const updated = { ...dm };
       delete updated.chatId;
       updated.userAAccountId = infoA.accountId;
@@ -92,7 +95,7 @@ async function main() {
       store.data.directMessages[dmKey] = updated;
       store._save();
 
-      // Bootstrap Autocrypt key exchange so mobile clients can encrypt immediately
+      // Bootstrap Autocrypt key exchange
       try {
         await dc.rpc.startIo(infoA.accountId).catch(() => {});
         await dc.rpc.startIo(infoB.accountId).catch(() => {});
@@ -117,14 +120,9 @@ async function main() {
     }
   }
 
-  // Flush final state synchronously before exit
   store.flush();
-
   console.log(`\nDone. migrated=${migrated} skipped=${skipped} failed=${failed}`);
   dc.close();
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main().catch((e) => { console.error(e); process.exit(1); });

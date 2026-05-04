@@ -29,7 +29,7 @@ import { readFileSync, existsSync, writeFileSync, renameSync, writeFile, rename 
 export class Store {
   constructor(filePath) {
     this.filePath = filePath;
-    this.data = { accounts: {}, orderChats: {}, communityGroups: {} };
+    this.data = { accounts: {}, orderChats: {}, communityGroups: {}, directMessages: {}, moderation: { blocks: {}, globalMutes: {}, mutedDms: {} } };
     this._load();
   }
 

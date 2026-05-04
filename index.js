@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { randomBytes } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -108,30 +107,12 @@ async function ensureUserAccount(username) {
   const promise = (async () => {
     try {
       const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
-
-      // Try username-based address first (hengthegoat@chat.domain).
-      // Chatmail creates the account on first connect if it doesn't exist yet.
-      const desiredAddr = `${username.toLowerCase()}@${CHATMAIL_DOMAIN}`;
-      const desiredPw   = rand(16);
-      let configured = false;
-      try {
-        await dc.setConfig(accountId, 'addr', desiredAddr);
-        await dc.setConfig(accountId, 'mail_pw', desiredPw);
-        await dc.setConfig(accountId, 'displayname', username);
-        await withTimeout(dc.configure(accountId), 30_000, 'configure');
-        configured = true;
-      } catch (e) {
-        console.warn(`[user-account] username addr failed for ${desiredAddr}, falling back to QR: ${e.message}`);
-      }
-
-      if (!configured) {
-        await withTimeout(
-          dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`),
-          20_000, 'setConfigFromQr'
-        );
-        await dc.setConfig(accountId, 'displayname', username);
-        await withTimeout(dc.configure(accountId), 30_000, 'configure (qr fallback)');
-      }
+      await withTimeout(
+        dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`),
+        20_000, 'setConfigFromQr'
+      );
+      await dc.setConfig(accountId, 'displayname', username);
+      await withTimeout(dc.configure(accountId), 30_000, 'configure');
 
       const addr     = await dc.getConfig(accountId, 'addr');
       const password = await dc.getConfig(accountId, 'mail_pw');
@@ -568,8 +549,6 @@ function mergeDmMessages(dcMessages, cachedMessages) {
   return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
 
-const rand = (bytes) => randomBytes(bytes).toString('hex');
-
 // ── Express ──────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
@@ -766,7 +745,15 @@ app.get('/messages', async (req, res) => {
     if (!chat) return res.json({ messages: [] });
 
     const botId = await ensureBotAccount();
-    const msgIds = await dc.getMessageIds(botId, chat.chatId);
+    let msgIds;
+    try {
+      msgIds = await withTimeout(dc.getMessageIds(botId, chat.chatId), 5_000, 'getMessageIds');
+    } catch (_) {
+      const newChatId = await dc.createGroupChat(botId, `Order #${order_id}`);
+      store.setOrderChat(order_id, { ...chat, chatId: newChatId });
+      console.log(`[orders] healed stale chatId for order ${order_id} → ${newChatId}`);
+      msgIds = [];
+    }
     const messages = (
       await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id))
     ).filter(Boolean).map(formatMessage);
@@ -921,7 +908,15 @@ app.get('/groups/:community_id/messages', async (req, res) => {
     if (!group) return res.json({ messages: [] });
 
     const botId = await ensureBotAccount();
-    const msgIds = await dc.getMessageIds(botId, group.chatId);
+    let msgIds;
+    try {
+      msgIds = await withTimeout(dc.getMessageIds(botId, group.chatId), 8_000, 'getMessageIds');
+    } catch (_) {
+      const newChatId = await dc.createGroupChat(botId, `${group.name || community_id} Community`);
+      store.setCommunityGroup(community_id, { ...store.getCommunityGroup(community_id), chatId: newChatId });
+      console.log(`[groups] healed stale chatId for community ${community_id} → ${newChatId}`);
+      msgIds = [];
+    }
     const recent = msgIds.slice(-limit);
     const messages = (
       await mapConcurrent(recent, (id) => dc.getMessage(botId, id))
