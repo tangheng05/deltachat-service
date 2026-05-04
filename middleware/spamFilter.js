@@ -22,7 +22,7 @@ export function spamFilter(req, res, next) {
     return res.status(400).json({ error: `Message exceeds ${MAX_MSG_LENGTH} character limit` });
   }
 
-  const chatContext = req.params.dm_key || req.params.community_id || req.params.order_id || 'global';
+  const chatContext = req.params.dm_key || req.params.community_id || req.params.order_id || req.body?.order_id || 'global';
   const dedupKey = `${sender_username}:${chatContext}`;
 
   const now = Date.now();

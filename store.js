@@ -24,7 +24,7 @@
  * }
  */
 
-import { readFileSync, existsSync, writeFileSync, renameSync, writeFile, rename } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
 
 export class Store {
   constructor(filePath) {
@@ -60,12 +60,18 @@ export class Store {
   _save() {
     clearTimeout(this._saveTimer);
     this._saveTimer = setTimeout(() => {
+      if (this._writing) return; // skip if a write is already in flight
+      this._writing = true;
       const tmp = this.filePath + '.tmp';
       const data = JSON.stringify(this.data, null, 2);
-      writeFile(tmp, data, (err) => {
-        if (err) { console.error('[store] write error:', err.message); return; }
-        rename(tmp, this.filePath, (e) => { if (e) console.error('[store] rename error:', e.message); });
-      });
+      try {
+        writeFileSync(tmp, data);
+        renameSync(tmp, this.filePath);
+      } catch (err) {
+        console.error('[store] write error:', err.message);
+      } finally {
+        this._writing = false;
+      }
     }, 100);
   }
 
@@ -386,9 +392,13 @@ export class Store {
   // accountId scopes the lookup so chatId numbers from different accounts don't collide.
   findDmKeyByChatId(chatId, accountId = null) {
     for (const [key, info] of Object.entries(this.data.directMessages)) {
+      if (info.dcExternal && info.sereAccountId === accountId && info.chatId === chatId) return key;
       if (accountId !== null) {
         if (info.userAAccountId === accountId && info.userAChatId === chatId) return key;
         if (info.userBAccountId === accountId && info.userBChatId === chatId) return key;
+        // Secondary chatIds (contact-request chat before merge, concurrent securejoins)
+        if (info.userAAccountId === accountId && Array.isArray(info.userAChatIds) && info.userAChatIds.includes(chatId)) return key;
+        if (info.userBAccountId === accountId && Array.isArray(info.userBChatIds) && info.userBChatIds.includes(chatId)) return key;
       } else {
         if (info.userAChatId === chatId || info.userBChatId === chatId) return key;
       }
@@ -434,12 +444,24 @@ export class Store {
   getDmsForUser(username) {
     const mutedDms = this.data.moderation.mutedDms[username] ?? [];
     return Object.entries(this.data.directMessages)
-      .filter(([, info]) => info.userA === username || info.userB === username)
-      .map(([dmKey, info]) => ({
-        dmKey, ...info, muted: mutedDms.includes(dmKey),
-        unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
-        lastMessage: info.lastMessage || null,
-      }));
+      .filter(([, info]) => info.userA === username || info.userB === username || info.sereUser === username)
+      .map(([dmKey, info]) => {
+        if (info.dcExternal) {
+          return {
+            dmKey, ...info,
+            userA: username,
+            userB: info.extAddr,
+            muted: mutedDms.includes(dmKey),
+            unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+            lastMessage: info.lastMessage || null,
+          };
+        }
+        return {
+          dmKey, ...info, muted: mutedDms.includes(dmKey),
+          unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+          lastMessage: info.lastMessage || null,
+        };
+      });
   }
 
   setDmLastActivity(dmKey, unixSeconds) {

@@ -7,6 +7,7 @@ export function groupGuard(store, req, res, next) {
 
   const group = store.getCommunityGroup(community_id);
   if (!group) return res.status(404).json({ error: 'Group not found — call POST /groups first' });
+  if (group.enabled === false) return res.status(403).json({ error: 'Group is disabled' });
 
   const bans = group.bans ?? {};
   const mutes = group.mutes ?? {};
