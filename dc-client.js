@@ -20,6 +20,10 @@ export class DeltaChatClient extends EventEmitter {
       this.emit('IncomingMsg', contextId, event);
     });
 
+    this._dc.on('MsgDeleted', (contextId, event) => {
+      this.emit('MsgDeleted', contextId, event);
+    });
+
     console.log(`[dc-rpc] started (accounts path: ${this.accountsPath})`);
   }
 

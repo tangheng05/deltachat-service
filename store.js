@@ -383,6 +383,14 @@ export class Store {
     this._save();
   }
 
+  removeDmCachedMessage(dmKey, msgId) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm?.messageCache?.length) return;
+    const before = dm.messageCache.length;
+    dm.messageCache = dm.messageCache.filter((m) => m.id !== msgId);
+    if (dm.messageCache.length !== before) this._save();
+  }
+
   getDmCachedMessages(dmKey) {
     const dm = this.data.directMessages[dmKey];
     if (!dm?.messageCache) return [];

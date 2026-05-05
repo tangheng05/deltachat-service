@@ -137,16 +137,28 @@ const QR_TTL_MS = 30 * 60 * 1_000;
 
 const _qrInFlight = new Map(); // accountId → Promise
 
+// Securejoin needs ~120s of continuous IO on the receiver's account to complete
+// (two chatmail round-trips, each up to 60s). We linger IO for 3 minutes after
+// every QR fetch — both cache hits and misses — so the handshake has room to
+// finish. The 3-min window also covers the drain interval, so chatmail still
+// gets push windows for mobile users between fetches.
+const QR_IO_LINGER_MS = 3 * 60_000;
+
 async function getQrCached(accountId) {
   const cached = qrCache.get(accountId);
-  if (cached && cached.expiresAt > Date.now()) return cached.qr;
+  if (cached && cached.expiresAt > Date.now()) {
+    // Cache hit: still start IO so securejoin can proceed if user is sharing QR
+    dc.rpc.startIo(accountId).catch(() => {});
+    ioSendLinger(accountId, QR_IO_LINGER_MS);
+    return cached.qr;
+  }
   if (_qrInFlight.has(accountId)) return _qrInFlight.get(accountId);
   const promise = (async () => {
     try {
       await dc.rpc.startIo(accountId).catch(() => {});
       const qr = await withTimeout(dc.rpc.getChatSecurejoinQrCode(accountId, null), 30_000, 'getChatSecurejoinQrCode');
       qrCache.set(accountId, { qr, expiresAt: Date.now() + QR_TTL_MS });
-      ioSendLinger(accountId); // stop IO after 45s so chatmail can push to mobile
+      ioSendLinger(accountId, QR_IO_LINGER_MS);
       return qr;
     } finally {
       _qrInFlight.delete(accountId);
@@ -306,9 +318,10 @@ function ioRelease(accountId) {
   ioLingers.set(accountId, t);
 }
 
-// Bump the linger timer for a send — keeps IO alive long enough for SMTP
-// delivery even when no SSE client is watching.
-function ioSendLinger(accountId) {
+// Bump the linger timer for a send or QR share — keeps IO alive long enough
+// for SMTP delivery or securejoin handshake even when no SSE client is watching.
+// Pass a custom `ms` to extend beyond the default IO_LINGER_MS (e.g. for QR).
+function ioSendLinger(accountId, ms = IO_LINGER_MS) {
   if (!accountId) return;
   if ((ioRefs.get(accountId) || 0) > 0) return; // SSE already holds it
   clearTimeout(ioLingers.get(accountId));
@@ -317,7 +330,7 @@ function ioSendLinger(accountId) {
     if ((ioRefs.get(accountId) || 0) === 0) {
       dc.rpc.stopIo(accountId).catch(() => {});
     }
-  }, IO_LINGER_MS);
+  }, ms);
   ioLingers.set(accountId, t);
 }
 
@@ -386,8 +399,13 @@ dc.on('IncomingMsg', async (contextId, event) => {
   try {
   const { chatId, msgId } = event;
 
-  const orderId     = store.findOrderIdByChatId(chatId);
-  const communityId = orderId ? null : store.findCommunityIdByChatId(chatId);
+  // Order and community chats live exclusively in the bot account.
+  // chatId numbers are local to each DC account — the same number in a user
+  // account has no relation to the same number in the bot account, so we must
+  // not look up order/community chatIds when the event comes from a user account.
+  const isBot       = contextId === botAccountId;
+  const orderId     = isBot ? store.findOrderIdByChatId(chatId) : null;
+  const communityId = (isBot && !orderId) ? store.findCommunityIdByChatId(chatId) : null;
   // Pass contextId so chatId numbers from different accounts don't collide
   let   dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId, contextId) : null;
 
@@ -441,7 +459,8 @@ dc.on('IncomingMsg', async (contextId, event) => {
         const extKey = `${receiverUser}:ext:${senderAddr}`;
         dmKey = extKey;
         dc.rpc.acceptChat(contextId, chatId).catch(() => {});
-        if (!store.getDm(extKey)) {
+        const existingExtDm = store.getDm(extKey);
+        if (!existingExtDm) {
           store.setDm(extKey, {
             dcExternal: true,
             sereUser: receiverUser,
@@ -456,6 +475,11 @@ dc.on('IncomingMsg', async (contextId, event) => {
           });
           console.log(`[IncomingMsg] created external DM ${extKey}`);
           sseBroadcast(`user:${receiverUser}`, { type: 'new_dm', dmKey: extKey, otherUser: senderAddr });
+        } else if (existingExtDm.chatId !== chatId) {
+          // Securejoin created a new verified chat — update stored chatId so
+          // dc.getMessageIds uses the correct chat when loading messages.
+          store.setDm(extKey, { ...existingExtDm, chatId });
+          console.log(`[IncomingMsg] updated dcExternal chatId for ${extKey}: ${existingExtDm.chatId} → ${chatId}`);
         }
       }
     } catch (e) {
@@ -499,11 +523,33 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
     if (dmKey && formatted && !formatted.isSystem) {
       store.addDmMessage(dmKey, formatted);
-      store.setDmLastMessage(dmKey, {
+      const lastMsg = {
         text: formatted.text,
         senderUsername: formatted.senderUsername,
         timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
-      });
+      };
+      store.setDmLastMessage(dmKey, lastMsg);
+      // Notify the receiving user's sidebar so it updates without requiring the
+      // chat to be open. The dm:chatKey broadcast above only reaches clients
+      // who already have that specific chat open.
+      const dmRecord = store.getDm(dmKey);
+      if (dmRecord) {
+        let notifyUser = null;
+        if (dmRecord.dcExternal) {
+          notifyUser = dmRecord.sereUser;
+        } else if (dmRecord.userAAccountId === contextId) {
+          notifyUser = dmRecord.userA; // A's account received it → notify A
+        } else if (dmRecord.userBAccountId === contextId) {
+          notifyUser = dmRecord.userB; // B's account received it → notify B
+        }
+        if (notifyUser) {
+          sseBroadcast(`user:${notifyUser}`, {
+            type: 'dm_updated',
+            dmKey,
+            lastMessage: lastMsg,
+          });
+        }
+      }
     }
 
     if (orderId) {
@@ -517,6 +563,32 @@ dc.on('IncomingMsg', async (contextId, event) => {
   }
   } catch (e) {
     console.error('[IncomingMsg] unhandled error:', e.message);
+  }
+});
+
+// ── DC MsgDeleted event ───────────────────────────────────────────────
+// Fired when DC processes a "Delete for Everyone" request from a remote DC
+// client. DC has already removed the message locally; we broadcast to SSE
+// so web clients remove it from their UI without needing a page reload.
+dc.on('MsgDeleted', (contextId, event) => {
+  try {
+    const { chatId, msgId } = event;
+    const isBot       = contextId === botAccountId;
+    const orderId     = isBot ? store.findOrderIdByChatId(chatId) : null;
+    const communityId = (isBot && !orderId) ? store.findCommunityIdByChatId(chatId) : null;
+    const dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId, contextId) : null;
+
+    const chatKey = orderId     ? `order:${orderId}`
+                  : communityId ? `community:${communityId}`
+                  :  dmKey      ? `dm:${dmKey}`
+                  : null;
+
+    if (!chatKey) return;
+
+    if (dmKey) store.removeDmCachedMessage(dmKey, msgId);
+    sseBroadcast(chatKey, { type: 'message_deleted', id: msgId });
+  } catch (e) {
+    console.error('[MsgDeleted]', e.message);
   }
 });
 
@@ -567,10 +639,13 @@ function formatDmMessage(msg, dm, viewerUsername) {
   }
   let replyTo = null;
   if (msg.quote?.text) {
+    // DC leaves authorDisplayName empty for the account owner's own outgoing messages.
+    // In a 1:1 DM there are only two participants, so empty = the viewer sent it.
+    const quoteAuthor = msg.quote.authorDisplayName || viewerUsername;
     replyTo = {
       id: msg.quote.msgId || null,
       text: msg.quote.text.substring(0, 200),
-      senderUsername: msg.quote.authorDisplayName || null,
+      senderUsername: quoteAuthor,
     };
   }
   // DC message state > 16 = outgoing (18=preparing,19=draft,20=pending,24=failed,26=delivered,28=read)
@@ -1538,7 +1613,7 @@ app.post('/dm', async (req, res) => {
   try {
     let dm = store.getDm(dmKey);
 
-    if (dm && dm.chatId && !dm.userAAccountId) {
+    if (dm && dm.chatId && !dm.userAAccountId && !dm.dcExternal) {
       // Legacy bot-DM — return as-is until migration runs
       return res.json({ dmKey, userA: dm.userA, userB: dm.userB, legacy: true });
     }
@@ -1563,6 +1638,28 @@ app.post('/dm', async (req, res) => {
       store.setDm(dmKey, dm);
       console.log(`[dm] created per-user DM — dmKey=${dmKey}`);
       bootstrapDmKeys(dmKey, infoA.accountId, infoB.accountId);
+    } else if (!dm.dcExternal && (!dm.userAAccountId || !dm.userBAccountId)) {
+      // DM was auto-created by IncomingMsg (DC mobile sender) with only the
+      // receiver's account filled in. Complete setup for the missing side now.
+      const [infoA, infoB] = await Promise.all([
+        ensureUserAccount(u1),
+        ensureUserAccount(u2),
+      ]);
+      let update = { ...dm, userAAccountId: infoA.accountId, userBAccountId: infoB.accountId };
+      if (!dm.userAChatId) {
+        const contactInA = await dc.createContact(infoA.accountId, infoB.addr, u2).catch(() => 0);
+        const chatIdA = contactInA ? await dc.createChatByContactId(infoA.accountId, contactInA).catch(() => 0) : 0;
+        if (chatIdA) { update = addDmChatId(update, 'A', chatIdA); }
+      }
+      if (!dm.userBChatId) {
+        const contactInB = await dc.createContact(infoB.accountId, infoA.addr, u1).catch(() => 0);
+        const chatIdB = contactInB ? await dc.createChatByContactId(infoB.accountId, contactInB).catch(() => 0) : 0;
+        if (chatIdB) { update = addDmChatId(update, 'B', chatIdB); }
+      }
+      store.setDm(dmKey, update);
+      dm = update;
+      console.log(`[dm] completed auto-DM setup — dmKey=${dmKey}`);
+      if (!dm.securejoinDone) bootstrapDmKeys(dmKey, infoA.accountId, infoB.accountId);
     } else if (dm.userAAccountId && !dm.securejoinDone) {
       // Runs securejoin for any DM that hasn't completed it yet, including ones
       // that used the old ZWS bootstrap (which fails on chatmail).
@@ -1760,12 +1857,36 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
 
     // External DC user DM — read from sereAccountId/chatId
     if (dm.dcExternal) {
-      const { sereAccountId, chatId, sereUser } = dm;
+      const { sereAccountId, chatId, sereUser, extAddr } = dm;
       if (sereAccountId) {
         dc.rpc.startIo(sereAccountId).catch(() => {});
-        ioSendLinger(sereAccountId);
+        ioSendLinger(sereAccountId, QR_IO_LINGER_MS); // longer linger — IMAP sync is async
       }
-      const msgIds = await dc.getMessageIds(sereAccountId, chatId).catch(() => []);
+      // Resolve canonical chatId via contact lookup, same as per-user DMs.
+      // After securejoin DC may create a new verified chatId distinct from the
+      // original contact-request chatId that was stored when the DM was created.
+      let resolvedChatId = chatId;
+      if (sereAccountId && extAddr) {
+        const contactId = await withTimeout(
+          dc.lookupContactIdByAddr(sereAccountId, extAddr), 6_000, 'ext/lookupContact'
+        ).catch(() => 0);
+        if (contactId) {
+          const canonical = await withTimeout(
+            dc.createChatByContactId(sereAccountId, contactId), 6_000, 'ext/createChatByContact'
+          ).catch(() => 0);
+          if (canonical && canonical !== chatId) {
+            store.setDm(dm_key, { ...dm, chatId: canonical });
+            resolvedChatId = canonical;
+            console.log(`[messages] healed ext chatId ${dm_key}: ${chatId}→${canonical}`);
+          }
+        }
+      }
+      // Collect from both stored and resolved chatIds to cover the split-chat case
+      const chatIds = [...new Set([chatId, resolvedChatId].filter(Boolean))];
+      const idSets = await Promise.all(
+        chatIds.map((cid) => dc.getMessageIds(sereAccountId, cid).catch(() => []))
+      );
+      const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
       const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(sereAccountId, id)))
         .filter(Boolean).map((msg) => formatDmMessage(msg, dm, sereUser));
       const cachedMessages = store.getDmCachedMessages(dm_key);
@@ -1950,7 +2071,16 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
       deleteAccountId = info.accountId;
     }
 
-    await dc.deleteMessages(deleteAccountId, [msgIdNum]);
+    try {
+      await dc.deleteMessages(deleteAccountId, [msgIdNum]);
+    } catch (dcErr) {
+      // DC may report "does not exist" when the message was already purged — this
+      // happens for contact-request messages after acceptChat reassigns their IDs.
+      // Treat it as a success: the message is already gone from DC's side.
+      if (!/does not exist/i.test(dcErr.message)) throw dcErr;
+      console.warn('[/dm/:key/messages/:id DELETE] DC already purged Msg#' + msgIdNum + ', cleaning cache');
+    }
+    store.removeDmCachedMessage(dm_key, msgIdNum);
     sseBroadcast(`dm:${dm_key}`, { type: 'message_deleted', id: msgIdNum });
     res.json({ success: true });
   } catch (e) {
@@ -2041,8 +2171,20 @@ app.get('/events/user/:username', (req, res) => {
 
   sseRegister(chatKey, res);
 
+  // Track which accountId we acquired IO for so we release the right one on close.
+  let acquiredAccountId = null;
+
   const info = store.getAccount(username);
-  ioAcquire(info?.accountId);
+  if (info?.accountId) {
+    acquiredAccountId = info.accountId;
+    ioAcquire(acquiredAccountId);
+  } else {
+    ensureUserAccount(username).then((newInfo) => {
+      if (res.writableEnded) return;
+      acquiredAccountId = newInfo.accountId;
+      ioAcquire(acquiredAccountId);
+    }).catch(() => {});
+  }
 
   const heartbeat = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
@@ -2051,7 +2193,7 @@ app.get('/events/user/:username', (req, res) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     sseUnregister(chatKey, res);
-    ioRelease(info?.accountId);
+    ioRelease(acquiredAccountId);
   });
 });
 
@@ -2084,6 +2226,25 @@ async function start() {
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
   setInterval(startAllUserIo, 30_000).unref(); // bot keepalive only
+
+  // Briefly start IO for every provisioned user account so DC downloads any
+  // pending IMAP mail and fires IncomingMsg. Runs every 3 minutes.
+  // IMPORTANT: interval MUST be > IO_LINGER_MS (45s) so chatmail has an
+  // off-window to push to DC mobile apps. Keeping IO on permanently prevents
+  // chatmail from sending push notifications to mobile clients.
+  // For active web users, IO is held by ioAcquire via SSE — this drain only
+  // serves as a fallback for accounts with no active SSE connection.
+  function drainUserAccounts() {
+    for (const [username, info] of Object.entries(store.getAllAccounts())) {
+      if (username === '__bot__' || !info?.accountId) continue;
+      if ((ioRefs.get(info.accountId) || 0) > 0) continue; // SSE already holds IO open
+      dc.rpc.startIo(info.accountId)
+        .then(() => ioSendLinger(info.accountId))
+        .catch((e) => console.warn(`[user-drain] startIo failed for ${username}:`, e.message));
+    }
+  }
+  drainUserAccounts();
+  setInterval(drainUserAccounts, 3 * 60_000).unref();
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);
