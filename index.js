@@ -69,6 +69,7 @@ async function ensureBotAccount() {
       if (cached) {
         botAccountId = cached.accountId;
         await withTimeout(dc.rpc.startIo(botAccountId), 15_000, 'startIo');
+        ioStartedAt.set(botAccountId, Date.now());
         return botAccountId;
       }
 
@@ -248,8 +249,19 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
       if (dm) {
         const isA = dm.userAAccountId === accountIdA;
         let update = { ...dm, securejoinDone: true };
-        // Set A's chatId (returned by secureJoin)
-        if (chatIdInA) update = addDmChatId(update, isA ? 'A' : 'B', chatIdInA);
+        // Set A's chatId (returned by secureJoin).
+        // secureJoin may return 0 when DC considers the contact already verified
+        // but the chat was created under a different chatId — fall back to canonical
+        // resolution so the sender always gets the correct post-securejoin chatId.
+        if (chatIdInA) {
+          update = addDmChatId(update, isA ? 'A' : 'B', chatIdInA);
+        } else {
+          const addrB = store.getAccount(isA ? dm.userB : dm.userA)?.addr;
+          if (addrB) {
+            const resolved = await resolveCanonicalChatId(accountIdA, addrB, dmKey, isA).catch(() => 0);
+            if (resolved) update = addDmChatId(update, isA ? 'A' : 'B', resolved);
+          }
+        }
         // Also resolve B's chatId so B can read messages without waiting for IncomingMsg
         const addrA = store.getAccount(isA ? dm.userA : dm.userB)?.addr;
         if (addrA) {
@@ -288,9 +300,14 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
 // The send path starts IO transiently; it stops via the linger timer once
 // no SSE client is watching.
 
-const ioRefs = new Map();     // accountId → active SSE ref count
-const ioLingers = new Map();  // accountId → setTimeout handle
+const ioRefs = new Map();      // accountId → active SSE ref count
+const ioLingers = new Map();   // accountId → setTimeout handle
+const ioStartedAt = new Map(); // accountId → timestamp of last startIo
 const IO_LINGER_MS = 45_000;  // keep IO alive 45s after last SSE client leaves
+// Chatmail servers drop idle IMAP connections after ~1-2 hours. DC treats IO as
+// still "running" (startIo is a no-op), so SMTP sends queue internally but never
+// fire. Cycle IO every 50 minutes for SSE-held accounts to force reconnection.
+const IO_REFRESH_MS = 50 * 60_000;
 
 function ioAcquire(accountId) {
   if (!accountId) return;
@@ -300,7 +317,37 @@ function ioAcquire(accountId) {
   dc.rpc.startIo(accountId).catch((e) =>
     console.warn(`[io] startIo failed for ${accountId}:`, e.message)
   );
+  ioStartedAt.set(accountId, Date.now());
 }
+
+// Periodically cycle IO for SSE-held accounts whose connections may have gone
+// stale. stopIo + startIo forces DC to re-authenticate and reconnect IMAP/SMTP.
+setInterval(async () => {
+  const now = Date.now();
+  for (const [accountId, refs] of ioRefs) {
+    if (refs <= 0) continue;
+    const startedAt = ioStartedAt.get(accountId) || 0;
+    if (now - startedAt < IO_REFRESH_MS) continue;
+    try {
+      await dc.rpc.stopIo(accountId).catch(() => {});
+      await dc.rpc.startIo(accountId).catch(() => {});
+      ioStartedAt.set(accountId, now);
+      console.log(`[io] refreshed stale IO for account ${accountId}`);
+    } catch (e) {
+      console.warn(`[io] refresh failed for account ${accountId}:`, e.message);
+    }
+  }
+  // Also refresh the bot account, which runs IO permanently.
+  if (botAccountId) {
+    const startedAt = ioStartedAt.get(botAccountId) || 0;
+    if (now - startedAt >= IO_REFRESH_MS) {
+      await dc.rpc.stopIo(botAccountId).catch(() => {});
+      await dc.rpc.startIo(botAccountId).catch(() => {});
+      ioStartedAt.set(botAccountId, now);
+      console.log(`[io] refreshed stale IO for bot account ${botAccountId}`);
+    }
+  }
+}, 10 * 60_000).unref(); // check every 10 min
 
 function ioRelease(accountId) {
   if (!accountId) return;
@@ -341,6 +388,7 @@ function startAllUserIo() {
     dc.rpc.startIo(botAccountId).catch((e) =>
       console.warn('[startAllUserIo] bot startIo failed:', e.message)
     );
+    ioStartedAt.set(botAccountId, Date.now());
   }
 }
 
@@ -426,18 +474,21 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
         if (!existingDm) {
           const receiverInfo = store.getAccount(receiverUser);
+          const senderInfo   = store.getAccount(senderUser);
           const userAChatId = u1 === receiverUser ? chatId : null;
           const userBChatId = u2 === receiverUser ? chatId : null;
           store.setDm(dmKey, {
             userA: u1, userB: u2,
-            userAAccountId: u1 === receiverUser ? receiverInfo.accountId : null,
+            userAAccountId: u1 === receiverUser ? receiverInfo.accountId : (senderInfo?.accountId || null),
             userAChatId,
-            userBAccountId: u2 === receiverUser ? receiverInfo.accountId : null,
+            userBAccountId: u2 === receiverUser ? receiverInfo.accountId : (senderInfo?.accountId || null),
             userBChatId,
             userAChatIds: userAChatId ? [userAChatId] : [],
             userBChatIds: userBChatId ? [userBChatId] : [],
             createdAt: Date.now(),
           });
+          // Accept so the receiver can reply immediately without waiting for bootstrap.
+          dc.rpc.acceptChat(contextId, chatId).catch(() => {});
           console.log(`[IncomingMsg] auto-created DM for mobile sender ${senderAddr} → ${dmKey}`);
           // Notify receiver's web client so the new conversation appears immediately
           // without waiting for the 30-second poll.
@@ -1810,10 +1861,12 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
           try {
             console.log(`[/dm/:key/send] key missing; attempting securejoin for ${dm_key}`);
             await bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
-            // Use the chatId securejoin stored — do NOT call resolveCanonicalChatId
-            // as it returns the old unverified chat which has no keys.
             const refreshedSenderInfo = store.getDmAccountAndChat(dm_key, sender_username) || senderInfo;
-            const retrySendChatId = refreshedSenderInfo.chatId || 0;
+            // After bootstrap, canonical chatId is resolved — use it directly.
+            const retrySendChatId = refreshedSenderInfo.chatId
+              || (recipientInfo?.addr
+                ? await resolveCanonicalChatId(senderInfo.accountId, recipientInfo.addr, dm_key, isUserA).catch(() => 0)
+                : 0);
             if (retrySendChatId) {
               const realId2 = await dc.sendTextMsg(senderInfo.accountId, retrySendChatId, text, replyToId);
               store.replaceDmMessageId(dm_key, localId, realId2);
