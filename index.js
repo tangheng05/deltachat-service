@@ -399,6 +399,10 @@ const sseClients = new Map();
 const recentOutgoingMsgIds = new Map();
 const OUTGOING_TTL_MS = 60_000;
 
+// Tracks message IDs edited via our API — overlays isEdited:true on GET responses
+// regardless of whether DC has propagated isEdited to the sender's copy yet.
+const editedMsgIds = new Set();
+
 setInterval(() => {
   const now = Date.now();
   for (const [k, ts] of recentOutgoingMsgIds) {
@@ -692,6 +696,7 @@ function formatMessage(msg) {
     text: m ? m[2] : raw,
     senderUsername: m ? m[1] : null,
     isSystem: !m,
+    isEdited: msg.isEdited === true || editedMsgIds.has(msg.id),
     timestamp: msg.timestamp,
     chatId: msg.chatId,
     replyTo,
@@ -712,7 +717,7 @@ const DM_SYSTEM_NOISE = [
 function formatDmMessage(msg, dm, viewerUsername) {
   // DC info messages (encryption warnings, group notices, etc.) — surface as system
   if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => (msg.text || '').toLowerCase().includes(s))) {
-    return { id: msg.id, text: msg.text || '', senderUsername: null, isSystem: true, timestamp: msg.timestamp, chatId: msg.chatId, replyTo: null };
+    return { id: msg.id, text: msg.text || '', senderUsername: null, isSystem: true, isEdited: false, timestamp: msg.timestamp, chatId: msg.chatId, replyTo: null };
   }
   let replyTo = null;
   if (msg.quote?.text) {
@@ -736,6 +741,7 @@ function formatDmMessage(msg, dm, viewerUsername) {
     text: msg.text || '',
     senderUsername,
     isSystem: false,
+    isEdited: msg.isEdited === true || editedMsgIds.has(msg.id),
     timestamp: msg.timestamp,
     chatId: msg.chatId,
     replyTo,
@@ -768,9 +774,10 @@ function mergeDmMessages(dcMessages, cachedMessages) {
         }
       }
     }
-    // DC entry always wins — it has the correct message ID for the viewer's account.
-    // Cache may hold IDs from the other participant's DC account (wrong perspective).
-    byKey.set(key, msg);
+    // DC entry always wins for ID/text — authoritative for viewer's account.
+    // Preserve isEdited:true from cache: DC may not set it on the sender's copy immediately.
+    const cachedIsEdited = byKey.get(key)?.isEdited === true;
+    byKey.set(key, { ...msg, isEdited: msg.isEdited || cachedIsEdited || editedMsgIds.has(msg.id) });
   }
   return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
@@ -1229,8 +1236,9 @@ app.patch('/groups/:community_id/messages/:msg_id', async (req, res) => {
 
     const newRaw = `💬 (${actor_username}): ${text.trim()}`;
     await dc.editMessage(botId, Number(msg_id), newRaw);
+    editedMsgIds.add(Number(msg_id));
 
-    sseBroadcast(`community:${community_id}`, { type: 'message_edited', id: Number(msg_id), text: text.trim(), senderUsername: actor_username });
+    sseBroadcast(`community:${community_id}`, { type: 'message_edited', id: Number(msg_id), text: text.trim(), senderUsername: actor_username, isEdited: true });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2224,9 +2232,10 @@ app.patch('/dm/:dm_key/messages/:message_id', async (req, res) => {
     if (!msg) return res.status(404).json({ error: 'Message not found' });
 
     await dc.editMessage(accountId, msgIdNum, text.trim());
+    editedMsgIds.add(msgIdNum);
 
-    store.updateDmCachedMessage(dm_key, msgIdNum, { text: text.trim() });
-    sseBroadcast(`dm:${dm_key}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username });
+    store.updateDmCachedMessage(dm_key, msgIdNum, { text: text.trim(), isEdited: true });
+    sseBroadcast(`dm:${dm_key}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username, isEdited: true });
     res.json({ success: true });
   } catch (e) {
     console.error('[/dm/:key/messages/:id PATCH]', e.message);
@@ -2296,8 +2305,9 @@ app.patch('/messages/:order_id/:message_id', async (req, res) => {
                  : msg.text.startsWith('🏪') ? `🏪 Seller (${sender_username}): `
                  : `💬 (${sender_username}): `;
     await dc.editMessage(botId, msgIdNum, prefix + text.trim());
+    editedMsgIds.add(msgIdNum);
 
-    sseBroadcast(`order:${order_id}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username });
+    sseBroadcast(`order:${order_id}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username, isEdited: true });
     res.json({ success: true });
   } catch (e) {
     console.error('[/messages/:order_id/:id PATCH]', e.message);
