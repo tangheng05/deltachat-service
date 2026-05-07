@@ -24,6 +24,10 @@ export class DeltaChatClient extends EventEmitter {
       this.emit('MsgDeleted', contextId, event);
     });
 
+    this._dc.on('MsgsChanged', (contextId, event) => {
+      this.emit('MsgsChanged', contextId, event);
+    });
+
     console.log(`[dc-rpc] started (accounts path: ${this.accountsPath})`);
   }
 
@@ -113,8 +117,17 @@ export class DeltaChatClient extends EventEmitter {
   }
 
   deleteMessages(accountId, msgIds) {
-    // Delta Chat RPC uses deleteMessages (plural)
     return this._dc.rpc.deleteMessages(accountId, msgIds);
+  }
+
+  deleteMessagesForAll(accountId, msgIds) {
+    // Sends a special delete-notification email so all participants' DC clients
+    // remove the message too ("delete for all"). deleteMessages() is local-only.
+    return this._dc.rpc.deleteMessagesForAll(accountId, msgIds);
+  }
+
+  editMessage(accountId, msgId, newText) {
+    return this._dc.rpc.sendEditRequest(accountId, msgId, newText);
   }
 
   deleteChat(accountId, chatId) {

@@ -643,6 +643,32 @@ dc.on('MsgDeleted', (contextId, event) => {
   }
 });
 
+// ── DC MsgsChanged event ──────────────────────────────────────────────
+// Fired for any message state change. We only care about DM edits (isEdited).
+// Community/order edits come only via REST and SSE is broadcast there directly.
+dc.on('MsgsChanged', async (contextId, event) => {
+  try {
+    const { chatId, msgId } = event;
+    if (!msgId) return;
+
+    const dmKey = store.findDmKeyByChatId(chatId, contextId);
+    if (!dmKey) return;
+
+    const msg = await dc.getMessage(contextId, msgId).catch(() => null);
+    if (!msg?.isEdited) return;
+
+    const dm = store.getDm(dmKey);
+    const ownerUser = dm?.userAAccountId === contextId ? dm.userA : dm?.userB;
+    const formatted = formatDmMessage(msg, dm, ownerUser);
+    if (!formatted || formatted.isSystem) return;
+
+    store.updateDmCachedMessage(dmKey, msgId, { text: formatted.text });
+    sseBroadcast(`dm:${dmKey}`, { type: 'message_edited', ...formatted });
+  } catch (e) {
+    console.error('[MsgsChanged]', e.message);
+  }
+});
+
 // ── Helpers ──────────────────────────────────────────────────────────
 const MSG_RE = /^(?:🛒 Buyer|🏪 Seller|💬 DM|💬)\s+\(([\w.-]+)\):\s*([\s\S]*)$/;
 
@@ -730,16 +756,21 @@ function mergeDmMessages(dcMessages, cachedMessages) {
   }
   for (const msg of dcMessages || []) {
     const key = dmMessageKey(msg);
-    // If this DC message's id already exists under a different key (timestamp
-    // drift between the cache entry and the DC-assigned timestamp), evict the
-    // stale cached entry so we don't end up with two copies of the same message.
-    if (msg.id != null && !byKey.has(key)) {
+    if (!byKey.has(key)) {
+      // Evict stale cache entries — covers two cases:
+      // 1. Same ID, different key (timestamp drift)
+      // 2. Same sender+timestamp, different text (message was edited)
+      const senderTs = `${msg.senderUsername ?? ""}|${msg.timestamp ?? 0}|`;
       for (const [k, m] of byKey) {
-        if (m.id === msg.id) { byKey.delete(k); break; }
+        if ((msg.id != null && m.id === msg.id) || k.startsWith(senderTs)) {
+          byKey.delete(k);
+          break;
+        }
       }
     }
-    const existing = byKey.get(key);
-    if (!existing || (!existing.id && msg.id)) byKey.set(key, msg);
+    // DC entry always wins — it has the correct message ID for the viewer's account.
+    // Cache may hold IDs from the other participant's DC account (wrong perspective).
+    byKey.set(key, msg);
   }
   return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
@@ -1173,6 +1204,33 @@ app.delete('/groups/:community_id/messages/:msg_id', async (req, res) => {
     } catch {}
 
     sseBroadcast(`community:${community_id}`, { type: 'message_deleted', id: Number(msg_id) });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PATCH /groups/:community_id/messages/:msg_id — edit own message ───
+app.patch('/groups/:community_id/messages/:msg_id', async (req, res) => {
+  const { community_id, msg_id } = req.params;
+  const { actor_username, text } = req.body;
+  if (!actor_username || !text?.trim()) return res.status(400).json({ error: 'actor_username and text required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  try {
+    const botId = await ensureBotAccount();
+    const msg = await dc.getMessage(botId, Number(msg_id)).catch(() => null);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    const senderMatch = msg.text?.match(MSG_RE);
+    if (senderMatch?.[1] !== actor_username) return res.status(403).json({ error: 'Can only edit your own messages' });
+
+    const newRaw = `💬 (${actor_username}): ${text.trim()}`;
+    await dc.editMessage(botId, Number(msg_id), newRaw);
+
+    sseBroadcast(`community:${community_id}`, { type: 'message_edited', id: Number(msg_id), text: text.trim(), senderUsername: actor_username });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2142,6 +2200,40 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
   }
 });
 
+// ── PATCH /dm/:dm_key/messages/:message_id — edit own DM message ──────
+app.patch('/dm/:dm_key/messages/:message_id', async (req, res) => {
+  const { dm_key, message_id } = req.params;
+  const { sender_username, text } = req.body;
+  if (!sender_username || !text?.trim()) return res.status(400).json({ error: 'sender_username and text required' });
+
+  const dm = store.getDm(dm_key);
+  if (!dm) return res.status(404).json({ error: 'DM not found' });
+
+  const isUserA = dm.userA === sender_username;
+  const isUserB = dm.userB === sender_username;
+  if (!isUserA && !isUserB) return res.status(403).json({ error: 'Not a participant' });
+
+  const accountId = isUserA ? dm.userAAccountId : dm.userBAccountId;
+  if (!accountId) return res.status(400).json({ error: 'Account not provisioned' });
+
+  try {
+    const msgIdNum = parseInt(message_id, 10);
+    if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
+
+    const msg = await dc.getMessage(accountId, msgIdNum).catch(() => null);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    await dc.editMessage(accountId, msgIdNum, text.trim());
+
+    store.updateDmCachedMessage(dm_key, msgIdNum, { text: text.trim() });
+    sseBroadcast(`dm:${dm_key}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/dm/:key/messages/:id PATCH]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── DELETE /messages/:order_id/:message_id ───────────────────────────
 app.delete('/messages/:order_id/:message_id', async (req, res) => {
   const order_id    = decodeURIComponent(req.params.order_id);
@@ -2170,6 +2262,45 @@ app.delete('/messages/:order_id/:message_id', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('[/messages/:order_id/:id DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PATCH /messages/:order_id/:message_id — edit own order message ───
+app.patch('/messages/:order_id/:message_id', async (req, res) => {
+  const order_id   = decodeURIComponent(req.params.order_id);
+  const message_id = req.params.message_id;
+  const { sender_username, text } = req.body;
+  if (!sender_username || !text?.trim()) return res.status(400).json({ error: 'sender_username and text required' });
+
+  const chat = store.getOrderChat(order_id);
+  if (!chat) return res.status(404).json({ error: 'Chat not found' });
+
+  const buyer  = (chat.buyerUsername  || '').toLowerCase();
+  const seller = (chat.sellerUsername || '').toLowerCase();
+  const sender = (sender_username     || '').toLowerCase();
+  if (buyer !== sender && seller !== sender) return res.status(403).json({ error: 'Not a participant' });
+
+  try {
+    const botId    = await ensureBotAccount();
+    const msgIdNum = parseInt(message_id, 10);
+    if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
+
+    const msg = await dc.getMessage(botId, msgIdNum).catch(() => null);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+    const senderMatch = msg.text?.match(MSG_RE);
+    if (senderMatch?.[1]?.toLowerCase() !== sender) return res.status(403).json({ error: 'Can only edit your own messages' });
+
+    const prefix = msg.text.startsWith('🛒') ? `🛒 Buyer (${sender_username}): `
+                 : msg.text.startsWith('🏪') ? `🏪 Seller (${sender_username}): `
+                 : `💬 (${sender_username}): `;
+    await dc.editMessage(botId, msgIdNum, prefix + text.trim());
+
+    sseBroadcast(`order:${order_id}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/messages/:order_id/:id PATCH]', e.message);
     res.status(500).json({ error: e.message });
   }
 });

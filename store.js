@@ -391,6 +391,17 @@ export class Store {
     if (dm.messageCache.length !== before) this._save();
   }
 
+  updateDmCachedMessage(dmKey, msgId, patch) {
+    const dm = this.data.directMessages[dmKey];
+    if (!dm?.messageCache?.length) return;
+    const idx = dm.messageCache.findIndex(m => m.id === msgId);
+    if (idx === -1) return;
+    const updated = { ...dm.messageCache[idx], ...patch };
+    updated._dedupeKey = this._dmDedupeKey(updated);
+    dm.messageCache[idx] = updated;
+    this._save();
+  }
+
   getDmCachedMessages(dmKey) {
     const dm = this.data.directMessages[dmKey];
     if (!dm?.messageCache) return [];
