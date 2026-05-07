@@ -146,7 +146,11 @@ export class Store {
   getCommunityGroup(communityId) { return this.data.communityGroups[String(communityId)] ?? null; }
 
   setCommunityGroup(communityId, info) {
-    this.data.communityGroups[String(communityId)] = info;
+    if (info === null) {
+      delete this.data.communityGroups[String(communityId)];
+    } else {
+      this.data.communityGroups[String(communityId)] = info;
+    }
     this._save();
   }
 
@@ -184,6 +188,24 @@ export class Store {
       if (info.chatId === chatId) return id;
     }
     return null;
+  }
+
+  countUserGroups(username) {
+    return Object.values(this.data.communityGroups)
+      .filter(g => g.type === 'user' && g.ownerUsername === username).length;
+  }
+
+  getUserGroups(username) {
+    return Object.entries(this.data.communityGroups)
+      .filter(([, g]) => g.type === 'user' && g.memberUsernames.includes(username))
+      .map(([id, g]) => ({
+        group_id: id,
+        name: g.name,
+        ownerUsername: g.ownerUsername,
+        memberCount: g.memberUsernames.length,
+        lastMessage: g.lastMessage ?? null,
+        createdAt: g.createdAt,
+      }));
   }
 
   // ── Group moderation ──────────────────────────────────────────────

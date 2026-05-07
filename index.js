@@ -1065,6 +1065,74 @@ app.post('/groups', async (req, res) => {
   }
 });
 
+// ── POST /user-groups — create a personal group (max 3 per user) ─────
+app.post('/user-groups', async (req, res) => {
+  const { owner_username, name } = req.body;
+  if (!owner_username || !name?.trim())
+    return res.status(400).json({ error: 'owner_username and name required' });
+  if (!USERNAME_RE.test(owner_username))
+    return res.status(400).json({ error: 'Invalid owner_username' });
+
+  if (store.countUserGroups(owner_username) >= 3)
+    return res.status(403).json({ error: 'Maximum 3 groups per user' });
+
+  try {
+    const botId  = await ensureBotAccount();
+    const chatId = await dc.createGroupChat(botId, name.trim());
+    const group_id = `ug_${owner_username}_${Date.now()}`;
+    const group = {
+      type: 'user',
+      chatId,
+      name: name.trim(),
+      ownerUsername: owner_username,
+      memberUsernames: [owner_username],
+      createdAt: Date.now(),
+      announcementMode: false,
+      joinMode: 'open',
+      enabled: true,
+      roles: { [owner_username]: 'owner' },
+      mutes: {},
+      bans: {},
+      pendingMembers: {},
+    };
+    store.setCommunityGroup(group_id, group);
+    console.log(`[user-groups] created — group_id=${group_id} owner=${owner_username} chatId=${chatId}`);
+    res.status(201).json({ group_id, name: group.name, chatId, ownerUsername: owner_username });
+  } catch (e) {
+    console.error('[/user-groups POST]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /user-groups/:username — list groups the user owns or is in ───
+app.get('/user-groups/:username', (req, res) => {
+  const { username } = req.params;
+  res.json({ groups: store.getUserGroups(username) });
+});
+
+// ── DELETE /user-groups/:group_id — owner deletes their group ─────────
+app.delete('/user-groups/:group_id', async (req, res) => {
+  const { group_id } = req.params;
+  const { owner_username } = req.body;
+  if (!owner_username) return res.status(400).json({ error: 'owner_username required' });
+
+  const group = store.getCommunityGroup(group_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if (group.type !== 'user') return res.status(403).json({ error: 'Not a user group' });
+  if (group.ownerUsername !== owner_username) return res.status(403).json({ error: 'Only the owner can delete this group' });
+
+  try {
+    const botId = await ensureBotAccount();
+    await dc.deleteChat(botId, group.chatId).catch(() => {});
+    store.setCommunityGroup(group_id, null);
+    sseBroadcast(`community:${group_id}`, { type: 'group_deleted' });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[/user-groups DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /groups/:community_id ─────────────────────────────────────────
 app.get('/groups/:community_id', (req, res) => {
   const { community_id } = req.params;
@@ -1074,6 +1142,8 @@ app.get('/groups/:community_id', (req, res) => {
   res.json({
     community_id,
     name: group.name,
+    type: group.type ?? 'community',
+    ownerUsername: group.ownerUsername ?? null,
     announcementMode: group.announcementMode ?? false,
     joinMode: group.joinMode ?? 'open',
     enabled: group.enabled ?? true,
@@ -1292,10 +1362,11 @@ app.get('/groups/:community_id/events', (req, res) => {
 });
 
 // ── GET /groups ───────────────────────────────────────────────────────
+// Returns community groups only. User groups are served via GET /user-groups/:username.
 app.get('/groups', (req, res) => {
   const { username } = req.query;
   const groups = Object.entries(store.data.communityGroups)
-    .filter(([, info]) => info.enabled !== false) // hide disabled groups from subscribers
+    .filter(([, info]) => (info.type ?? 'community') === 'community' && info.enabled !== false)
     .map(([id, info]) => ({
       community_id: id,
       name: info.name,
