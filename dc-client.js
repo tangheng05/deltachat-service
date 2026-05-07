@@ -113,8 +113,13 @@ export class DeltaChatClient extends EventEmitter {
   }
 
   deleteMessages(accountId, msgIds) {
-    // Delta Chat RPC uses deleteMessages (plural)
     return this._dc.rpc.deleteMessages(accountId, msgIds);
+  }
+
+  deleteMessagesForAll(accountId, msgIds) {
+    // Sends a special delete-notification email so all participants' DC clients
+    // remove the message too ("delete for all"). deleteMessages() is local-only.
+    return this._dc.rpc.deleteMessagesForAll(accountId, msgIds);
   }
 
   deleteChat(accountId, chatId) {

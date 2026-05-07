@@ -689,7 +689,7 @@ function formatDmMessage(msg, dm, viewerUsername) {
     return { id: msg.id, text: msg.text || '', senderUsername: null, isSystem: true, timestamp: msg.timestamp, chatId: msg.chatId, replyTo: null };
   }
   let replyTo = null;
-  if (msg.quote?.text) {
+  if (msg.quote?.text && msg.quote.text !== 'Deleted message') {
     // DC leaves authorDisplayName empty for the account owner's own outgoing messages.
     // In a 1:1 DM there are only two participants, so empty = the viewer sent it.
     const quoteAuthor = msg.quote.authorDisplayName || viewerUsername;
@@ -725,21 +725,36 @@ function dmMessageKey(msg) {
 
 function mergeDmMessages(dcMessages, cachedMessages) {
   const byKey = new Map();
+  // Build a secondary index: msgId → cached message, so we can rescue replyTo
+  // when id-based eviction removes a cached entry below.
+  const cachedById = new Map();
   for (const msg of cachedMessages || []) {
     byKey.set(dmMessageKey(msg), msg);
+    if (msg.id != null) cachedById.set(msg.id, msg);
   }
   for (const msg of dcMessages || []) {
     const key = dmMessageKey(msg);
     // If this DC message's id already exists under a different key (timestamp
     // drift between the cache entry and the DC-assigned timestamp), evict the
     // stale cached entry so we don't end up with two copies of the same message.
+    let evicted = null;
     if (msg.id != null && !byKey.has(key)) {
       for (const [k, m] of byKey) {
-        if (m.id === msg.id) { byKey.delete(k); break; }
+        if (m.id === msg.id) { evicted = m; byKey.delete(k); break; }
       }
     }
     const existing = byKey.get(key);
-    if (!existing || (!existing.id && msg.id)) byKey.set(key, msg);
+    if (!existing || (!existing.id && msg.id)) {
+      // DC has lost the quoted message reference — rescue replyTo from cache
+      // so the reply bubble doesn't regress to "Deleted message" after refresh.
+      const cachedReplyTo = (evicted || existing || cachedById.get(msg.id))?.replyTo;
+      const needsRescue = msg.replyTo?.text === 'Deleted message' && cachedReplyTo?.text && cachedReplyTo.text !== 'Deleted message';
+      byKey.set(key, needsRescue ? { ...msg, replyTo: cachedReplyTo } : msg);
+    } else if (existing?.replyTo?.text === 'Deleted message') {
+      // Cached entry has DC's stale placeholder — strip it so the frontend
+      // doesn't show a misleading "Deleted message" bubble.
+      byKey.set(key, { ...existing, replyTo: null });
+    }
   }
   return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
@@ -2124,8 +2139,16 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
       deleteAccountId = info.accountId;
     }
 
+    const isLegacyBot = dm.chatId && !dm.userAAccountId && !dm.dcExternal;
     try {
-      await dc.deleteMessages(deleteAccountId, [msgIdNum]);
+      if (isLegacyBot) {
+        // Bot-mediated chats: local delete only (bot owns the message, no per-user DC client to notify)
+        await dc.deleteMessages(deleteAccountId, [msgIdNum]);
+      } else {
+        // Per-user DM or external DM: send delete-for-all so the mobile DC client
+        // also removes the message. Falls back to local delete if not supported.
+        await dc.deleteMessagesForAll(deleteAccountId, [msgIdNum]);
+      }
     } catch (dcErr) {
       // DC may report "does not exist" when the message was already purged — this
       // happens for contact-request messages after acceptChat reassigns their IDs.
