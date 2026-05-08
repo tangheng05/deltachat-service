@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { randomBytes } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1110,6 +1111,24 @@ app.get('/user-groups/:username', (req, res) => {
   res.json({ groups: store.getUserGroups(username) });
 });
 
+// ── PATCH /user-groups/:group_id — owner updates group settings ───────
+app.patch('/user-groups/:group_id', (req, res) => {
+  const { group_id } = req.params;
+  const { owner_username, isPublic, name } = req.body;
+  if (!owner_username) return res.status(400).json({ error: 'owner_username required' });
+
+  const group = store.getCommunityGroup(group_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if (group.type !== 'user') return res.status(403).json({ error: 'Not a user group' });
+  if (group.ownerUsername !== owner_username) return res.status(403).json({ error: 'Only the owner can update this group' });
+
+  const updated = { ...group };
+  if (typeof isPublic === 'boolean') updated.isPublic = isPublic;
+  if (name?.trim()) updated.name = name.trim();
+  store.setCommunityGroup(group_id, updated);
+  res.json({ success: true, isPublic: updated.isPublic ?? false, name: updated.name });
+});
+
 // ── DELETE /user-groups/:group_id — owner deletes their group ─────────
 app.delete('/user-groups/:group_id', async (req, res) => {
   const { group_id } = req.params;
@@ -1129,6 +1148,183 @@ app.delete('/user-groups/:group_id', async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     console.error('[/user-groups DELETE]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /groups/:community_id/invite-links — create invite link ───────
+// Any member can create an invite link.
+app.post('/groups/:community_id/invite-links', (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username } = req.body;
+  if (!actor_username) return res.status(400).json({ error: 'actor_username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if (!group.memberUsernames?.includes(actor_username))
+    return res.status(403).json({ error: 'You are not a member of this group' });
+
+  const token = randomBytes(8).toString('hex'); // 16-char hex
+  store.createGroupInviteLink(community_id, token, actor_username);
+  res.status(201).json({ token });
+});
+
+// ── GET /groups/:community_id/invite-links — list active links ──────────
+// Members see only their own links; owner/admin see all.
+app.get('/groups/:community_id/invite-links', (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username } = req.query;
+  if (!actor_username) return res.status(400).json({ error: 'actor_username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if (!group.memberUsernames?.includes(actor_username))
+    return res.status(403).json({ error: 'You are not a member of this group' });
+
+  const role = (group.roles ?? {})[actor_username];
+  const isPrivileged = role === 'owner' || role === 'admin';
+  const allLinks = store.getGroupInviteLinks(community_id);
+  const links = isPrivileged ? allLinks : allLinks.filter(l => l.createdBy === actor_username);
+  res.json({ links });
+});
+
+// ── DELETE /groups/:community_id/invite-links/:token — revoke a link ───
+// Owner/admin can revoke any link; members can only revoke their own.
+app.delete('/groups/:community_id/invite-links/:token', (req, res) => {
+  const { community_id, token } = req.params;
+  const { actor_username } = req.body;
+  if (!actor_username) return res.status(400).json({ error: 'actor_username required' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if (!group.memberUsernames?.includes(actor_username))
+    return res.status(403).json({ error: 'You are not a member of this group' });
+
+  const role = (group.roles ?? {})[actor_username];
+  const isPrivileged = role === 'owner' || role === 'admin';
+  const link = store.getGroupInviteLinks(community_id).find(l => l.token === token);
+  if (link && !isPrivileged && link.createdBy !== actor_username)
+    return res.status(403).json({ error: 'You can only revoke your own invite links' });
+
+  store.revokeGroupInviteLink(community_id, token);
+  res.json({ success: true });
+});
+
+// ── GET /invite/:token — preview invite (group info, no join yet) ───────
+app.get('/invite/:token', (req, res) => {
+  const { token } = req.params;
+  const result = store.getInviteLinkGroup(token);
+  if (!result) return res.status(404).json({ error: 'Invite link not found or has been revoked' });
+
+  const { groupId, group } = result;
+  res.json({
+    group_id: groupId,
+    name: group.name,
+    type: group.type ?? 'community',
+    ownerUsername: group.ownerUsername ?? null,
+    memberCount: group.memberUsernames?.length ?? 0,
+  });
+});
+
+// ── POST /invite/:token/join — join group via invite link ───────────────
+app.post('/invite/:token/join', (req, res) => {
+  const { token } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const result = store.getInviteLinkGroup(token);
+  if (!result) return res.status(404).json({ error: 'Invite link not found or has been revoked' });
+
+  const { groupId, group } = result;
+
+  if ((group.bans ?? {})[username])
+    return res.status(403).json({ error: 'You are banned from this group', reason: 'banned' });
+
+  if (group.memberUsernames?.includes(username))
+    return res.json({ success: true, status: 'already_member', group_id: groupId, name: group.name });
+
+  // Invite links bypass joinMode — the link itself is the invitation
+  store.setGroupMember(groupId, username, 'member');
+  sseBroadcast(`community:${groupId}`, { type: 'member_joined', username });
+  res.json({ success: true, status: 'joined', group_id: groupId, name: group.name });
+});
+
+// ── POST /groups/:community_id/invite/send — DM an invite link to a Serey user ──
+// Any group member can send an invite. Creates a token, opens/creates the DM,
+// and sends a special __SEREY_GROUP_INVITE__ message the frontend renders as a card.
+app.post('/groups/:community_id/invite/send', async (req, res) => {
+  const { community_id } = req.params;
+  const { actor_username, target_username } = req.body;
+  if (!actor_username || !target_username)
+    return res.status(400).json({ error: 'actor_username and target_username required' });
+  if (actor_username === target_username)
+    return res.status(400).json({ error: 'Cannot invite yourself' });
+
+  const group = store.getCommunityGroup(community_id);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+
+  if (!group.memberUsernames?.includes(actor_username))
+    return res.status(403).json({ error: 'You are not a member of this group' });
+
+  if (group.memberUsernames?.includes(target_username))
+    return res.status(409).json({ error: 'User is already a member' });
+
+  if ((group.bans ?? {})[target_username])
+    return res.status(403).json({ error: 'This user is banned from this group' });
+
+  try {
+    // Ensure DM exists between actor and target (same logic as POST /dm)
+    const [u1, u2] = [actor_username, target_username].sort();
+    const dmKey = `${u1}:${u2}`;
+    let dm = store.getDm(dmKey);
+
+    if (!dm) {
+      const [infoA, infoB] = await Promise.all([ensureUserAccount(u1), ensureUserAccount(u2)]);
+      const contactInA = await dc.createContact(infoA.accountId, infoB.addr, u2);
+      const contactInB = await dc.createContact(infoB.accountId, infoA.addr, u1);
+      const chatIdA = await dc.createChatByContactId(infoA.accountId, contactInA);
+      const chatIdB = await dc.createChatByContactId(infoB.accountId, contactInB);
+      dm = {
+        userA: u1, userB: u2,
+        userAAccountId: infoA.accountId, userAChatId: chatIdA,
+        userBAccountId: infoB.accountId, userBChatId: chatIdB,
+        userAChatIds: chatIdA ? [chatIdA] : [],
+        userBChatIds: chatIdB ? [chatIdB] : [],
+        createdAt: Date.now(),
+      };
+      store.setDm(dmKey, dm);
+      bootstrapDmKeys(dmKey, infoA.accountId, infoB.accountId);
+    }
+
+    // Create a fresh token for this invite
+    const token = randomBytes(8).toString('hex');
+    store.createGroupInviteLink(community_id, token, actor_username);
+
+    // Special marker the frontend detects and renders as an invite card
+    const payload = JSON.stringify({ token, groupId: community_id, groupName: group.name, invitedBy: actor_username });
+    const inviteText = `__SEREY_GROUP_INVITE__:${payload}`;
+
+    // Send via actor's own DC account
+    const senderInfo = store.getDmAccountAndChat(dmKey, actor_username);
+    if (!senderInfo) return res.status(500).json({ error: 'DM account not provisioned' });
+
+    await dc.rpc.startIo(senderInfo.accountId).catch(() => {});
+    ioSendLinger(senderInfo.accountId);
+    const realId = await dc.sendTextMsg(senderInfo.accountId, senderInfo.chatId, inviteText);
+    markOutgoing(senderInfo.accountId, realId);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const msgObj = { id: realId, text: inviteText, senderUsername: actor_username, isSystem: false, timestamp: nowSec };
+    store.addDmMessage(dmKey, msgObj);
+    store.setDmLastMessage(dmKey, { text: inviteText, senderUsername: actor_username, timestamp: nowSec });
+    sseBroadcast(`dm:${dmKey}`, msgObj);
+
+    res.json({ success: true, token, dmKey });
+  } catch (e) {
+    console.error('[/groups/invite/send]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1366,10 +1562,18 @@ app.get('/groups/:community_id/events', (req, res) => {
 app.get('/groups', (req, res) => {
   const { username } = req.query;
   const groups = Object.entries(store.data.communityGroups)
-    .filter(([, info]) => (info.type ?? 'community') === 'community' && info.enabled !== false)
+    .filter(([, info]) => {
+      if (info.enabled === false) return false;
+      if ((info.type ?? 'community') === 'community') return true;
+      if (info.type === 'user' && info.isPublic) return true;
+      return false;
+    })
     .map(([id, info]) => ({
       community_id: id,
       name: info.name,
+      type: info.type ?? 'community',
+      ownerUsername: info.ownerUsername ?? null,
+      isPublic: info.isPublic ?? (info.type !== 'user'),
       memberCount: info.memberUsernames.length,
       createdAt: info.createdAt,
       announcementMode: info.announcementMode ?? false,
@@ -2288,16 +2492,23 @@ app.patch('/dm/:dm_key/messages/:message_id', async (req, res) => {
   const dm = store.getDm(dm_key);
   if (!dm) return res.status(404).json({ error: 'DM not found' });
 
-  const isUserA = dm.userA === sender_username;
-  const isUserB = dm.userB === sender_username;
-  if (!isUserA && !isUserB) return res.status(403).json({ error: 'Not a participant' });
-
-  const accountId = isUserA ? dm.userAAccountId : dm.userBAccountId;
-  if (!accountId) return res.status(400).json({ error: 'Account not provisioned' });
+  const isParticipant = dm.dcExternal ? dm.sereUser === sender_username : (dm.userA === sender_username || dm.userB === sender_username);
+  if (!isParticipant) return res.status(403).json({ error: 'Not a participant' });
 
   try {
     const msgIdNum = parseInt(message_id, 10);
     if (isNaN(msgIdNum)) return res.status(400).json({ error: 'Invalid message_id' });
+
+    let accountId;
+    if (dm.dcExternal) {
+      accountId = dm.sereAccountId;
+    } else if (dm.chatId && !dm.userAAccountId) {
+      accountId = await ensureBotAccount();
+    } else {
+      const info = store.getDmAccountAndChat(dm_key, sender_username);
+      if (!info) return res.status(500).json({ error: 'Account not found' });
+      accountId = info.accountId;
+    }
 
     const msg = await dc.getMessage(accountId, msgIdNum).catch(() => null);
     if (!msg) return res.status(404).json({ error: 'Message not found' });

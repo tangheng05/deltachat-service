@@ -195,6 +195,37 @@ export class Store {
       .filter(g => g.type === 'user' && g.ownerUsername === username).length;
   }
 
+  // ── Group invite links ────────────────────────────────────────────
+
+  createGroupInviteLink(groupId, token, createdBy) {
+    const group = this.data.communityGroups[String(groupId)];
+    if (!group) return;
+    group.inviteLinks ??= {};
+    group.inviteLinks[token] = { createdBy, createdAt: Date.now() };
+    this._save();
+  }
+
+  // Scans all groups for the token. Returns { groupId, group } or null.
+  getInviteLinkGroup(token) {
+    for (const [groupId, group] of Object.entries(this.data.communityGroups)) {
+      if (group.inviteLinks?.[token]) return { groupId, group };
+    }
+    return null;
+  }
+
+  revokeGroupInviteLink(groupId, token) {
+    const group = this.data.communityGroups[String(groupId)];
+    if (!group?.inviteLinks) return;
+    delete group.inviteLinks[token];
+    this._save();
+  }
+
+  getGroupInviteLinks(groupId) {
+    const group = this.data.communityGroups[String(groupId)];
+    if (!group?.inviteLinks) return [];
+    return Object.entries(group.inviteLinks).map(([token, info]) => ({ token, ...info }));
+  }
+
   getUserGroups(username) {
     return Object.entries(this.data.communityGroups)
       .filter(([, g]) => g.type === 'user' && g.memberUsernames.includes(username))
@@ -202,6 +233,7 @@ export class Store {
         group_id: id,
         name: g.name,
         ownerUsername: g.ownerUsername,
+        isPublic: g.isPublic ?? false,
         memberCount: g.memberUsernames.length,
         lastMessage: g.lastMessage ?? null,
         createdAt: g.createdAt,
