@@ -56,6 +56,20 @@ async function mapConcurrent(items, fn, concurrency = 8) {
   return results;
 }
 
+// ── Multi-device account config ──────────────────────────────────────
+// The chatmail provisioning default is delete_server_after=1, which deletes a
+// message from the server ~1s after THIS service downloads it. When the same
+// account is also logged into DC mobile, whichever side fetches first wins and
+// the message vanishes for the other — so mobile intermittently misses messages
+// the server grabbed first. Setting it to 0 leaves messages on the server
+// (chatmail enforces its own delete_mails_after retention), so the web service
+// and the phone can each fetch independently. bcc_self=1 makes messages sent
+// from Serey web also appear on the user's phone.
+async function applyMultiDeviceConfig(accountId) {
+  await dc.setConfig(accountId, 'delete_server_after', '0');
+  await dc.setConfig(accountId, 'bcc_self', '1');
+}
+
 // ── Bot account ─────────────────────────────────────────────────────
 let botAccountId = null;
 let _botProvisionPromise = null;
@@ -78,6 +92,7 @@ async function ensureBotAccount() {
       const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
       await withTimeout(dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`), 20_000, 'setConfigFromQr');
       await dc.setConfig(accountId, 'displayname', 'Serey System');
+      await applyMultiDeviceConfig(accountId);
       await withTimeout(dc.configure(accountId), 30_000, 'configure');
 
       const addr = await dc.getConfig(accountId, 'addr');
@@ -114,6 +129,7 @@ async function ensureUserAccount(username) {
         20_000, 'setConfigFromQr'
       );
       await dc.setConfig(accountId, 'displayname', username);
+      await applyMultiDeviceConfig(accountId);
       await withTimeout(dc.configure(accountId), 30_000, 'configure');
 
       const addr     = await dc.getConfig(accountId, 'addr');
@@ -2061,6 +2077,87 @@ app.post('/dm', async (req, res) => {
     res.json({ dmKey, userA: dm.userA, userB: dm.userB });
   } catch (e) {
     console.error('[/dm]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /dm/external ────────────────────────────────────────────────
+// Lets a Serey user initiate a DM to an external Delta Chat user.
+// Body: { serey_username, ext_addr } OR { serey_username, qr_content }
+// qr_content can be an OPENPGP4FPR: securejoin URI or a plain DC email address.
+app.post('/dm/external', async (req, res) => {
+  let { serey_username, ext_addr, qr_content } = req.body;
+
+  // Parse ext_addr from OPENPGP4FPR QR content: OPENPGP4FPR:FINGERPRINT#a=addr@host&...
+  if (!ext_addr && qr_content) {
+    const raw = String(qr_content).trim();
+    const m = raw.match(/[?&#]a=([^&#\s]+)/i) || raw.match(/^OPENPGP4FPR:[^#]+#a=([^&#\s]+)/i);
+    if (m) {
+      ext_addr = m[1];
+    } else if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) {
+      ext_addr = raw; // plain email pasted
+    }
+  }
+
+  if (!serey_username) return res.status(400).json({ error: 'serey_username required' });
+  if (!ext_addr) return res.status(400).json({ error: 'ext_addr or valid qr_content required' });
+  ext_addr = ext_addr.trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ext_addr))
+    return res.status(400).json({ error: 'Invalid ext_addr — must be a valid email address' });
+
+  const dmKey = `${serey_username}:ext:${ext_addr}`;
+
+  // Idempotent — return existing DM straight away
+  const existing = store.getDm(dmKey);
+  if (existing?.dcExternal) return res.json({ dmKey, extAddr: ext_addr });
+
+  try {
+    const sereInfo = await ensureUserAccount(serey_username);
+    const sereAccountId = sereInfo.accountId;
+
+    await dc.rpc.startIo(sereAccountId).catch(() => {});
+    ioSendLinger(sereAccountId, QR_IO_LINGER_MS);
+
+    const contactId = await withTimeout(
+      dc.createContact(sereAccountId, ext_addr, ext_addr), 8_000, 'createContact/external'
+    );
+    const chatId = await withTimeout(
+      dc.createChatByContactId(sereAccountId, contactId), 8_000, 'createChatByContactId/external'
+    );
+    await dc.rpc.acceptChat(sereAccountId, chatId).catch(() => {});
+
+    store.setDm(dmKey, {
+      dcExternal: true,
+      sereUser: serey_username,
+      extAddr: ext_addr,
+      extName: ext_addr,
+      sereAccountId,
+      chatId,
+      createdAt: Date.now(),
+      lastMessage: null,
+      lastMessageAt: 0,
+      lastSeenBy: {},
+    });
+
+    // If the caller provided a full securejoin QR, kick off the handshake async.
+    // This upgrades the chat to a verified encrypted channel once B's device responds.
+    // The IncomingMsg handler will update chatId in the store when securejoin completes.
+    if (qr_content && /^OPENPGP4FPR:/i.test(String(qr_content))) {
+      dc.rpc.secureJoin(sereAccountId, String(qr_content))
+        .then((newChatId) => {
+          if (newChatId && newChatId !== chatId) {
+            const dm = store.getDm(dmKey);
+            if (dm) store.setDm(dmKey, { ...dm, chatId: newChatId });
+            console.log(`[/dm/external] securejoin done for ${dmKey}, chatId ${chatId}→${newChatId}`);
+          }
+        })
+        .catch((e) => console.warn(`[/dm/external] securejoin failed for ${dmKey}:`, e.message));
+    }
+
+    console.log(`[/dm/external] created — ${dmKey}`);
+    res.json({ dmKey, extAddr: ext_addr });
+  } catch (e) {
+    console.error('[/dm/external]', e.message);
     res.status(500).json({ error: e.message });
   }
 });
