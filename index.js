@@ -2126,12 +2126,14 @@ app.post('/dm', async (req, res) => {
 app.post('/dm/external', async (req, res) => {
   let { serey_username, ext_addr, qr_content } = req.body;
 
-  // Parse ext_addr from OPENPGP4FPR QR content: OPENPGP4FPR:FINGERPRINT#a=addr@host&...
+  // Parse ext_addr from QR/invite content. Both forms carry the address in a=:
+  //   OPENPGP4FPR:FINGERPRINT#a=addr@host&...
+  //   https://i.delta.chat/#FINGERPRINT&...&a=addr%40host&...   (URL-encoded)
   if (!ext_addr && qr_content) {
     const raw = String(qr_content).trim();
     const m = raw.match(/[?&#]a=([^&#\s]+)/i) || raw.match(/^OPENPGP4FPR:[^#]+#a=([^&#\s]+)/i);
     if (m) {
-      ext_addr = m[1];
+      try { ext_addr = decodeURIComponent(m[1]); } catch { ext_addr = m[1]; } // %40 → @
     } else if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) {
       ext_addr = raw; // plain email pasted
     }
@@ -2164,7 +2166,11 @@ app.post('/dm/external', async (req, res) => {
     );
     await dc.rpc.acceptChat(sereAccountId, chatId).catch(() => {});
 
-    const securejoinQr = (qr_content && /^OPENPGP4FPR:/i.test(String(qr_content))) ? String(qr_content) : null;
+    // A securejoin QR can arrive as an OPENPGP4FPR: URI or its https://i.delta.chat/
+    // invite-link equivalent — both carry the i=/s= handshake tokens DC needs.
+    const securejoinQr = (qr_content && /^(OPENPGP4FPR:|https:\/\/i\.delta\.chat\/)/i.test(String(qr_content)))
+      ? String(qr_content)
+      : null;
 
     store.setDm(dmKey, {
       dcExternal: true,
