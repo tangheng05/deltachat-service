@@ -306,6 +306,42 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
   return promise;
 }
 
+// ── External-contact securejoin ──────────────────────────────────────
+// For DMs with an external Delta Chat user we control only the Serey side, so
+// we can't run the two-account bootstrap above. Instead we drive a securejoin
+// from the stored OPENPGP4FPR QR the user scanned. chatmail refuses unencrypted
+// mail, so a message sent before this handshake completes is silently dropped —
+// the send path awaits this first. Deduplicated per dmKey.
+const _extSecurejoinInFlight = new Map(); // dmKey → Promise
+
+function ensureExtSecurejoin(dmKey, accountId, qr) {
+  if (!qr || !accountId) return Promise.resolve();
+  if (_extSecurejoinInFlight.has(dmKey)) return _extSecurejoinInFlight.get(dmKey);
+  const promise = (async () => {
+    try {
+      await dc.rpc.startIo(accountId).catch(() => {});
+      ioSendLinger(accountId, QR_IO_LINGER_MS);
+      const newChatId = await withTimeout(dc.rpc.secureJoin(accountId, qr), 120_000, 'ext/secureJoin');
+      const cur = store.getDm(dmKey);
+      if (cur) {
+        store.setDm(dmKey, {
+          ...cur,
+          securejoinDone: true,
+          chatId: (newChatId && newChatId !== cur.chatId) ? newChatId : cur.chatId,
+        });
+      }
+      console.log(`[ext securejoin] done for ${dmKey}`);
+    } catch (e) {
+      console.warn(`[ext securejoin] failed for ${dmKey}:`, e.message);
+      throw e;
+    } finally {
+      _extSecurejoinInFlight.delete(dmKey);
+    }
+  })();
+  _extSecurejoinInFlight.set(dmKey, promise);
+  return promise;
+}
+
 // ── Per-user IO lifecycle ────────────────────────────────────────────
 // Per-user DC accounts must NOT have IMAP running permanently.
 // Chatmail only sends push notifications to mobile DC when no other IMAP
@@ -540,6 +576,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
             extName: contact.displayName || senderAddr,
             sereAccountId: contextId,
             chatId,
+            securejoinDone: true, // inbound mail proves keys are exchanged
             createdAt: Date.now(),
             lastMessage: null,
             lastMessageAt: 0,
@@ -547,10 +584,11 @@ dc.on('IncomingMsg', async (contextId, event) => {
           });
           console.log(`[IncomingMsg] created external DM ${extKey}`);
           sseBroadcast(`user:${receiverUser}`, { type: 'new_dm', dmKey: extKey, otherUser: senderAddr });
-        } else if (existingExtDm.chatId !== chatId) {
+        } else if (existingExtDm.chatId !== chatId || !existingExtDm.securejoinDone) {
           // Securejoin created a new verified chat — update stored chatId so
-          // dc.getMessageIds uses the correct chat when loading messages.
-          store.setDm(extKey, { ...existingExtDm, chatId });
+          // dc.getMessageIds uses the correct chat when loading messages. Inbound
+          // mail also confirms the key exchange completed.
+          store.setDm(extKey, { ...existingExtDm, chatId, securejoinDone: true });
           console.log(`[IncomingMsg] updated dcExternal chatId for ${extKey}: ${existingExtDm.chatId} → ${chatId}`);
         }
       }
@@ -2126,6 +2164,8 @@ app.post('/dm/external', async (req, res) => {
     );
     await dc.rpc.acceptChat(sereAccountId, chatId).catch(() => {});
 
+    const securejoinQr = (qr_content && /^OPENPGP4FPR:/i.test(String(qr_content))) ? String(qr_content) : null;
+
     store.setDm(dmKey, {
       dcExternal: true,
       sereUser: serey_username,
@@ -2133,25 +2173,19 @@ app.post('/dm/external', async (req, res) => {
       extName: ext_addr,
       sereAccountId,
       chatId,
+      securejoinQr,        // kept so the send path can (re)run the handshake if needed
+      securejoinDone: false,
       createdAt: Date.now(),
       lastMessage: null,
       lastMessageAt: 0,
       lastSeenBy: {},
     });
 
-    // If the caller provided a full securejoin QR, kick off the handshake async.
-    // This upgrades the chat to a verified encrypted channel once B's device responds.
-    // The IncomingMsg handler will update chatId in the store when securejoin completes.
-    if (qr_content && /^OPENPGP4FPR:/i.test(String(qr_content))) {
-      dc.rpc.secureJoin(sereAccountId, String(qr_content))
-        .then((newChatId) => {
-          if (newChatId && newChatId !== chatId) {
-            const dm = store.getDm(dmKey);
-            if (dm) store.setDm(dmKey, { ...dm, chatId: newChatId });
-            console.log(`[/dm/external] securejoin done for ${dmKey}, chatId ${chatId}→${newChatId}`);
-          }
-        })
-        .catch((e) => console.warn(`[/dm/external] securejoin failed for ${dmKey}:`, e.message));
+    // Kick off the securejoin handshake now. It only completes once the external
+    // contact's device answers (so it may lag if they're offline), but starting
+    // it here means the key is usually ready by the time the first message sends.
+    if (securejoinQr) {
+      ensureExtSecurejoin(dmKey, sereAccountId, securejoinQr).catch(() => {});
     }
 
     console.log(`[/dm/external] created — ${dmKey}`);
@@ -2200,12 +2234,37 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       (async () => {
         await dc.rpc.startIo(dm.sereAccountId).catch((e) => console.warn('[ext send] startIo:', e.message));
         ioSendLinger(dm.sereAccountId);
+        // chatmail silently drops unencrypted mail, so a message sent before the
+        // securejoin key exchange finishes just vanishes. Wait for the handshake
+        // (or start one from the stored QR) before sending the first message.
+        if (!dm.securejoinDone && dm.securejoinQr) {
+          const inflight = _extSecurejoinInFlight.get(dm_key);
+          await (inflight || ensureExtSecurejoin(dm_key, dm.sereAccountId, dm.securejoinQr)).catch(() => {});
+        }
+        // Re-read — securejoin may have stored a new verified chatId.
+        const fresh = store.getDm(dm_key) || dm;
+        const sendChatId = fresh.chatId;
         try {
-          const realId = await dc.sendTextMsg(dm.sereAccountId, dm.chatId, text, replyToId);
+          const realId = await dc.sendTextMsg(dm.sereAccountId, sendChatId, text, replyToId);
           store.replaceDmMessageId(dm_key, localId, realId);
           markOutgoing(dm.sereAccountId, realId);
           sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
         } catch (e) {
+          // "key is missing" → handshake not done yet. Run it once and retry.
+          const emsg = String(e.message || '').toLowerCase();
+          if ((emsg.includes('key is missing') || emsg.includes('cannot send')) && fresh.securejoinQr) {
+            try {
+              await ensureExtSecurejoin(dm_key, dm.sereAccountId, fresh.securejoinQr);
+              const retryChatId = (store.getDm(dm_key) || fresh).chatId;
+              const realId = await dc.sendTextMsg(dm.sereAccountId, retryChatId, text, replyToId);
+              store.replaceDmMessageId(dm_key, localId, realId);
+              markOutgoing(dm.sereAccountId, realId);
+              sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
+              return;
+            } catch (e2) {
+              console.error('[/dm/:key/send ext] retry failed:', e2.message);
+            }
+          }
           console.error('[/dm/:key/send ext]', e.message);
           sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
         }
