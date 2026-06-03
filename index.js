@@ -112,6 +112,50 @@ async function ensureBotAccount() {
   return _botProvisionPromise;
 }
 
+// One-time reconciliation run at startup. DC can hand out an accountId that
+// store.json already assigned to a different username (e.g. after the DC account
+// DBs were rebuilt/restored out of sync with the store). Two usernames then map
+// to one accountId, and findUsernameByAccountId returns the wrong one — silently
+// misfiling incoming mail under the wrong user. We detect this by comparing each
+// account's LIVE configured address with the stored one: a mismatch means the
+// mapping is stale, so we clear it and the user re-provisions a fresh account.
+async function reconcileAccounts() {
+  let cleared = 0;
+  for (const [username, info] of Object.entries(store.getAllAccounts())) {
+    if (username === '__bot__' || !info?.accountId) continue;
+    const liveAddr = await dc.getConfig(info.accountId, 'addr').catch(() => null);
+    if (liveAddr && info.addr && liveAddr !== info.addr) {
+      console.warn(`[reconcile] "${username}" → account ${info.accountId}: live addr ${liveAddr} != stored ${info.addr} — stale mapping, clearing (will re-provision on next use)`);
+      store.clearAccount(username);
+      cleared++;
+    }
+  }
+  if (cleared) console.log(`[reconcile] cleared ${cleared} stale account mapping(s)`);
+  else console.log('[reconcile] all account mappings consistent');
+}
+
+// Repair external DMs that were filed under the wrong Serey user. The earlier
+// reverse-lookup bug created records like { sereUser: "crypto-kh", sereAccountId: 177 }
+// where account 177 actually belongs to "vutto". Those records keep capturing the
+// real owner's incoming mail (findDmKeyByChatId matches by sereAccountId+chatId),
+// so we re-key each one to its true owner, identified by the account's live address.
+async function reconcileExternalDms() {
+  let fixed = 0;
+  for (const [key, dm] of Object.entries(store.getAllDms())) {
+    if (!dm?.dcExternal || !dm.sereAccountId) continue;
+    const liveAddr = await dc.getConfig(dm.sereAccountId, 'addr').catch(() => null);
+    if (!liveAddr) continue;
+    const trueOwner = store.findUsernameByAddr(liveAddr);
+    if (!trueOwner || trueOwner === dm.sereUser) continue;
+    const correctKey = `${trueOwner}:ext:${dm.extAddr}`;
+    console.warn(`[reconcile] ext DM "${key}" on account ${dm.sereAccountId}=${liveAddr} belongs to "${trueOwner}", not "${dm.sereUser}" — re-keying to "${correctKey}"`);
+    store.rekeyExternalDm(key, correctKey, trueOwner);
+    fixed++;
+  }
+  if (fixed) console.log(`[reconcile] re-keyed ${fixed} misfiled external DM(s)`);
+  else console.log('[reconcile] all external DMs correctly owned');
+}
+
 // ── Per-user account provisioning ───────────────────────────────────
 const _userProvisionMap = new Map();
 
@@ -645,7 +689,14 @@ dc.on('IncomingMsg', async (contextId, event) => {
       const contact     = await dc.getContact(contextId, msg.fromId);
       const senderAddr  = contact.address;
       const senderUser  = store.findUsernameByAddr(senderAddr);
-      const receiverUser = store.findUsernameByAccountId(contextId);
+      // Resolve the receiver by the account's LIVE address, not its accountId.
+      // DC can reuse an accountId after a DB rebuild, leaving two usernames
+      // mapped to the same id in store.json — accountId lookup then returns the
+      // wrong (stale) username and misfiles the message. The address is unique
+      // per Serey user, so it's authoritative; fall back to id only if needed.
+      const receiverAddr = await dc.getConfig(contextId, 'addr').catch(() => null);
+      const receiverUser = (receiverAddr && store.findUsernameByAddr(receiverAddr))
+                        || store.findUsernameByAccountId(contextId);
 
       if (senderUser && receiverUser) {
         const [u1, u2] = [senderUser, receiverUser].sort();
@@ -687,6 +738,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
         }
       } else if (receiverUser) {
         // External DC user — not provisioned in Serey, sender is from outside
+        console.log(`[IncomingMsg] inbound external mail: ${senderAddr} → serey user "${receiverUser}" (account ${contextId}, chat ${chatId})`);
         const extKey = `${receiverUser}:ext:${senderAddr}`;
         dmKey = extKey;
         dc.rpc.acceptChat(contextId, chatId).catch(() => {});
@@ -728,7 +780,14 @@ dc.on('IncomingMsg', async (contextId, event) => {
     }
   }
 
-  if (!orderId && !communityId && !dmKey) return;
+  if (!orderId && !communityId && !dmKey) {
+    // Inbound message we couldn't route to any order/community/DM. Logging it
+    // surfaces mail that silently vanishes (e.g. receiver account not resolved).
+    if (contextId !== botAccountId) {
+      console.warn(`[IncomingMsg] DROPPED unmapped inbound on account ${contextId} (chat ${chatId}, msg ${msgId}) — no order/community/dm match`);
+    }
+    return;
+  }
 
   const chatKey = orderId     ? `order:${orderId}`
                 : communityId ? `community:${communityId}`
@@ -2969,6 +3028,8 @@ process.on('uncaughtException', (err) => { console.error(err); shutdown(); proce
 async function start() {
   dc.start();
   await ensureBotAccount();
+  await reconcileAccounts();    // repair stale/duplicate accountId mappings before serving
+  await reconcileExternalDms(); // re-file external DMs that landed under the wrong user
 
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();

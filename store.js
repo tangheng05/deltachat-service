@@ -89,7 +89,24 @@ export class Store {
   getAllAccounts() { return this.data.accounts; }
 
   setAccount(username, info) {
+    // A DC accountId must map to exactly one username. If another username
+    // already claims this accountId, that mapping is stale (DC reused the id
+    // after a DB rebuild) — drop it so the reverse lookup can't misfile mail
+    // under the wrong user.
+    if (info?.accountId != null) {
+      for (const [other, oi] of Object.entries(this.data.accounts)) {
+        if (other !== username && other !== '__bot__' && oi?.accountId === info.accountId) {
+          console.warn(`[store] accountId ${info.accountId} reassigned "${other}" → "${username}"; clearing stale mapping for "${other}"`);
+          delete this.data.accounts[other];
+        }
+      }
+    }
     this.data.accounts[username] = info;
+    this._save();
+  }
+
+  clearAccount(username) {
+    delete this.data.accounts[username];
     this._save();
   }
 
@@ -475,7 +492,12 @@ export class Store {
       } else {
         if (info.userAChatId === chatId || info.userBChatId === chatId) return key;
       }
-      if (info.chatId === chatId) return key; // legacy bot-DM fallback
+      // Legacy bot-DM fallback: ONLY for old records with no per-account fields.
+      // Modern external/per-user DMs carry their own account ids; matching them
+      // here by bare chatId would cross accounts (chatId numbers are per-account)
+      // and misroute mail to the wrong conversation/user.
+      if (!info.dcExternal && info.userAAccountId == null && info.userBAccountId == null
+          && info.chatId === chatId) return key;
     }
     return null;
   }
@@ -510,6 +532,23 @@ export class Store {
     for (const list of Object.values(this.data.moderation.mutedDms ?? {})) {
       const idx = list.indexOf(dmKey);
       if (idx !== -1) list.splice(idx, 1);
+    }
+    this._save();
+  }
+
+  getAllDms() { return this.data.directMessages; }
+
+  // Move a misfiled external DM to the key/sereUser of its true account owner.
+  // If a correct record already exists, drop the misfiled duplicate instead.
+  rekeyExternalDm(oldKey, newKey, newSereUser) {
+    const dm = this.data.directMessages[oldKey];
+    if (!dm || oldKey === newKey) return;
+    if (this.data.directMessages[newKey]) {
+      delete this.data.directMessages[oldKey];
+    } else {
+      dm.sereUser = newSereUser;
+      this.data.directMessages[newKey] = dm;
+      delete this.data.directMessages[oldKey];
     }
     this._save();
   }
