@@ -6,3 +6,4 @@ dc-accounts/
 package-lock.json
 .env.example
 *.md
+!README.md
