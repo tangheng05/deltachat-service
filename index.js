@@ -56,6 +56,20 @@ async function mapConcurrent(items, fn, concurrency = 8) {
   return results;
 }
 
+// ── Multi-device account config ──────────────────────────────────────
+// The chatmail provisioning default is delete_server_after=1, which deletes a
+// message from the server ~1s after THIS service downloads it. When the same
+// account is also logged into DC mobile, whichever side fetches first wins and
+// the message vanishes for the other — so mobile intermittently misses messages
+// the server grabbed first. Setting it to 0 leaves messages on the server
+// (chatmail enforces its own delete_mails_after retention), so the web service
+// and the phone can each fetch independently. bcc_self=1 makes messages sent
+// from Serey web also appear on the user's phone.
+async function applyMultiDeviceConfig(accountId) {
+  await dc.setConfig(accountId, 'delete_server_after', '0');
+  await dc.setConfig(accountId, 'bcc_self', '1');
+}
+
 // ── Bot account ─────────────────────────────────────────────────────
 let botAccountId = null;
 let _botProvisionPromise = null;
@@ -78,6 +92,7 @@ async function ensureBotAccount() {
       const accountId = await withTimeout(dc.addAccount(), 15_000, 'addAccount');
       await withTimeout(dc.setConfigFromQr(accountId, `dcaccount:https://${CHATMAIL_DOMAIN}/new`), 20_000, 'setConfigFromQr');
       await dc.setConfig(accountId, 'displayname', 'Serey System');
+      await applyMultiDeviceConfig(accountId);
       await withTimeout(dc.configure(accountId), 30_000, 'configure');
 
       const addr = await dc.getConfig(accountId, 'addr');
@@ -97,6 +112,50 @@ async function ensureBotAccount() {
   return _botProvisionPromise;
 }
 
+// One-time reconciliation run at startup. DC can hand out an accountId that
+// store.json already assigned to a different username (e.g. after the DC account
+// DBs were rebuilt/restored out of sync with the store). Two usernames then map
+// to one accountId, and findUsernameByAccountId returns the wrong one — silently
+// misfiling incoming mail under the wrong user. We detect this by comparing each
+// account's LIVE configured address with the stored one: a mismatch means the
+// mapping is stale, so we clear it and the user re-provisions a fresh account.
+async function reconcileAccounts() {
+  let cleared = 0;
+  for (const [username, info] of Object.entries(store.getAllAccounts())) {
+    if (username === '__bot__' || !info?.accountId) continue;
+    const liveAddr = await dc.getConfig(info.accountId, 'addr').catch(() => null);
+    if (liveAddr && info.addr && liveAddr !== info.addr) {
+      console.warn(`[reconcile] "${username}" → account ${info.accountId}: live addr ${liveAddr} != stored ${info.addr} — stale mapping, clearing (will re-provision on next use)`);
+      store.clearAccount(username);
+      cleared++;
+    }
+  }
+  if (cleared) console.log(`[reconcile] cleared ${cleared} stale account mapping(s)`);
+  else console.log('[reconcile] all account mappings consistent');
+}
+
+// Repair external DMs that were filed under the wrong Serey user. The earlier
+// reverse-lookup bug created records like { sereUser: "crypto-kh", sereAccountId: 177 }
+// where account 177 actually belongs to "vutto". Those records keep capturing the
+// real owner's incoming mail (findDmKeyByChatId matches by sereAccountId+chatId),
+// so we re-key each one to its true owner, identified by the account's live address.
+async function reconcileExternalDms() {
+  let fixed = 0;
+  for (const [key, dm] of Object.entries(store.getAllDms())) {
+    if (!dm?.dcExternal || !dm.sereAccountId) continue;
+    const liveAddr = await dc.getConfig(dm.sereAccountId, 'addr').catch(() => null);
+    if (!liveAddr) continue;
+    const trueOwner = store.findUsernameByAddr(liveAddr);
+    if (!trueOwner || trueOwner === dm.sereUser) continue;
+    const correctKey = `${trueOwner}:ext:${dm.extAddr}`;
+    console.warn(`[reconcile] ext DM "${key}" on account ${dm.sereAccountId}=${liveAddr} belongs to "${trueOwner}", not "${dm.sereUser}" — re-keying to "${correctKey}"`);
+    store.rekeyExternalDm(key, correctKey, trueOwner);
+    fixed++;
+  }
+  if (fixed) console.log(`[reconcile] re-keyed ${fixed} misfiled external DM(s)`);
+  else console.log('[reconcile] all external DMs correctly owned');
+}
+
 // ── Per-user account provisioning ───────────────────────────────────
 const _userProvisionMap = new Map();
 
@@ -114,6 +173,7 @@ async function ensureUserAccount(username) {
         20_000, 'setConfigFromQr'
       );
       await dc.setConfig(accountId, 'displayname', username);
+      await applyMultiDeviceConfig(accountId);
       await withTimeout(dc.configure(accountId), 30_000, 'configure');
 
       const addr     = await dc.getConfig(accountId, 'addr');
@@ -288,6 +348,165 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
   })();
   _bootstrapInFlight.set(dmKey, promise);
   return promise;
+}
+
+// ── External-contact securejoin ──────────────────────────────────────
+// For DMs with an external Delta Chat user we control only the Serey side, so
+// we can't run the two-account bootstrap above. Instead we drive a securejoin
+// from the stored OPENPGP4FPR QR the user scanned. chatmail refuses unencrypted
+// mail, so a message sent before this handshake completes is silently dropped —
+// the send path awaits this first. Deduplicated per dmKey.
+const _extSecurejoinInFlight = new Map(); // dmKey → Promise
+
+function ensureExtSecurejoin(dmKey, accountId, qr) {
+  if (!qr || !accountId) return Promise.resolve();
+  if (_extSecurejoinInFlight.has(dmKey)) return _extSecurejoinInFlight.get(dmKey);
+  const promise = (async () => {
+    try {
+      await dc.rpc.startIo(accountId).catch(() => {});
+      ioSendLinger(accountId, QR_IO_LINGER_MS);
+      const newChatId = await withTimeout(dc.rpc.secureJoin(accountId, qr), 120_000, 'ext/secureJoin');
+      // NOTE: secureJoin() returning only means the handshake was *initiated*.
+      // The key exchange finishes later, when the contact's device answers (it
+      // arrives as IncomingMsg). So we adopt a new verified chatId if given, but
+      // we do NOT mark securejoinDone — that only becomes true once a send
+      // succeeds or an inbound message confirms the keys are present.
+      const cur = store.getDm(dmKey);
+      if (cur && newChatId && newChatId !== cur.chatId) {
+        store.setDm(dmKey, { ...cur, chatId: newChatId });
+      }
+      console.log(`[ext securejoin] initiated for ${dmKey} (chatId=${newChatId ?? cur?.chatId ?? 'none'})`);
+      // secureJoin() returned the verified chat — try delivering anything queued.
+      // It stays queued if the peer hasn't answered the handshake yet (keys not ready).
+      flushExtSends(dmKey).catch(() => {});
+    } catch (e) {
+      console.warn(`[ext securejoin] failed for ${dmKey}:`, e.message);
+      throw e;
+    } finally {
+      _extSecurejoinInFlight.delete(dmKey);
+    }
+  })();
+  _extSecurejoinInFlight.set(dmKey, promise);
+  return promise;
+}
+
+// ── External-DM outbound queue ───────────────────────────────────────
+// chatmail rejects a send until the securejoin key exchange has completed
+// ("key is missing"), and that completion happens asynchronously after the
+// remote device answers. So instead of failing early messages, we queue them
+// and flush once the keys land — triggered by incoming handshake/messages and
+// by a short backoff timer.
+const _extPendingSends = new Map(); // dmKey → [{ localId, text, replyToId }]
+const _extFlushing = new Map();     // dmKey → bool (guards concurrent flush)
+const _extRetryTimers = new Map();  // dmKey → timeout
+
+function queueExtSend(dmKey, item) {
+  if (!_extPendingSends.has(dmKey)) _extPendingSends.set(dmKey, []);
+  _extPendingSends.get(dmKey).push(item);
+}
+
+async function flushExtSends(dmKey) {
+  const queue = _extPendingSends.get(dmKey);
+  if (!queue || queue.length === 0) return;
+  if (_extFlushing.get(dmKey)) return;
+  _extFlushing.set(dmKey, true);
+  try {
+    const dm = store.getDm(dmKey);
+    if (!dm?.dcExternal) { _extPendingSends.delete(dmKey); return; }
+    await dc.rpc.startIo(dm.sereAccountId).catch(() => {});
+    ioSendLinger(dm.sereAccountId, QR_IO_LINGER_MS);
+    // Make sure a handshake is in progress (no-op if already running).
+    if (!dm.securejoinDone && dm.securejoinQr) {
+      ensureExtSecurejoin(dmKey, dm.sereAccountId, dm.securejoinQr).catch(() => {});
+    }
+    while (queue.length > 0) {
+      const item = queue[0];
+      const cur = store.getDm(dmKey) || dm;
+      // Candidate chats to send on: the stored (securejoin-returned) chatId first,
+      // then the contact's canonical chat. After securejoin the verified, sendable
+      // chat can differ from the transient chat a handshake message landed in, so
+      // we try both and let the encryption check below pick the one that works.
+      const candidates = [];
+      if (cur.chatId) candidates.push(cur.chatId);
+      try {
+        const contactId = await dc.lookupContactIdByAddr(dm.sereAccountId, dm.extAddr).catch(() => 0);
+        const altChat = contactId ? await dc.createChatByContactId(dm.sereAccountId, contactId).catch(() => 0) : 0;
+        if (altChat && !candidates.includes(altChat)) candidates.push(altChat);
+      } catch {}
+
+      if (candidates.length === 0) {
+        // No chat established yet (securejoin hasn't returned a chatId). Keep the
+        // message queued; ensureExtSecurejoin / IncomingMsg / the timer will retry.
+        console.log(`[ext flush] ${queue.length} message(s) waiting for verified chat — ${dmKey}`);
+        break;
+      }
+
+      let sent = false, lastErr = null;
+      for (const chatId of candidates) {
+        try {
+          const realId = await dc.sendTextMsg(dm.sereAccountId, chatId, item.text, item.replyToId);
+          // CRITICAL: a send only counts as delivered if DC actually ENCRYPTED it.
+          // Before the securejoin key exchange completes, DC happily creates an
+          // unencrypted message (sendMsg returns an id, no error) — but chatmail
+          // silently drops cleartext mail, so it never reaches the peer. We detect
+          // that via showPadlock, delete the dead cleartext copy, and keep the
+          // message queued to retry once the keys land. Default true so a missing
+          // field never makes us drop a genuinely-sent message.
+          const padlock = await dc.getMessage(dm.sereAccountId, realId)
+            .then((m) => m?.showPadlock !== false)
+            .catch(() => true);
+          if (!padlock) {
+            await dc.deleteMessages(dm.sereAccountId, [realId]).catch(() => {});
+            lastErr = new Error('key is missing'); // not encrypted yet → treat as not ready
+            continue;
+          }
+          store.replaceDmMessageId(dmKey, item.localId, realId);
+          markOutgoing(dm.sereAccountId, realId);
+          sseBroadcast(`dm:${dmKey}`, { type: 'message_id_updated', localId: item.localId, realId });
+          // Lock onto the chat that actually encrypted and remember keys are ready.
+          const c2 = store.getDm(dmKey) || cur;
+          store.setDm(dmKey, { ...c2, chatId, securejoinDone: true });
+          sent = true;
+          console.log(`[ext flush] delivered queued message for ${dmKey} (chatId=${chatId}, encrypted)`);
+          break;
+        } catch (e) { lastErr = e; }
+      }
+      if (sent) { queue.shift(); continue; }
+
+      const emsg = String(lastErr?.message || '').toLowerCase();
+      if (emsg.includes('key is missing') || emsg.includes('cannot send')) {
+        console.log(`[ext flush] ${queue.length} message(s) waiting for key exchange — ${dmKey}`);
+        break; // keys not ready yet — keep queued, retry on next incoming/timer
+      }
+      console.error(`[ext flush] send failed for ${dmKey}:`, lastErr?.message);
+      sseBroadcast(`dm:${dmKey}`, { type: 'message_send_failed', localId: item.localId });
+      queue.shift();
+    }
+  } finally {
+    _extFlushing.delete(dmKey);
+    if (!_extPendingSends.get(dmKey)?.length) _extPendingSends.delete(dmKey);
+  }
+}
+
+// Backoff retry loop so queued messages still go out if the handshake completes
+// without an inbound message we'd otherwise flush on. Runs for ~a few minutes.
+function scheduleExtFlush(dmKey) {
+  if (_extRetryTimers.has(dmKey)) return; // loop already running
+  let attempt = 0;
+  const tick = async () => {
+    await flushExtSends(dmKey).catch(() => {});
+    if (_extPendingSends.get(dmKey)?.length && attempt < 12) {
+      const delay = Math.min(5_000 * Math.pow(1.4, attempt++), 30_000);
+      const t = setTimeout(tick, delay);
+      t.unref?.();
+      _extRetryTimers.set(dmKey, t);
+    } else {
+      _extRetryTimers.delete(dmKey);
+    }
+  };
+  const t = setTimeout(tick, 5_000);
+  t.unref?.();
+  _extRetryTimers.set(dmKey, t);
 }
 
 // ── Per-user IO lifecycle ────────────────────────────────────────────
@@ -470,7 +689,14 @@ dc.on('IncomingMsg', async (contextId, event) => {
       const contact     = await dc.getContact(contextId, msg.fromId);
       const senderAddr  = contact.address;
       const senderUser  = store.findUsernameByAddr(senderAddr);
-      const receiverUser = store.findUsernameByAccountId(contextId);
+      // Resolve the receiver by the account's LIVE address, not its accountId.
+      // DC can reuse an accountId after a DB rebuild, leaving two usernames
+      // mapped to the same id in store.json — accountId lookup then returns the
+      // wrong (stale) username and misfiles the message. The address is unique
+      // per Serey user, so it's authoritative; fall back to id only if needed.
+      const receiverAddr = await dc.getConfig(contextId, 'addr').catch(() => null);
+      const receiverUser = (receiverAddr && store.findUsernameByAddr(receiverAddr))
+                        || store.findUsernameByAccountId(contextId);
 
       if (senderUser && receiverUser) {
         const [u1, u2] = [senderUser, receiverUser].sort();
@@ -512,6 +738,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
         }
       } else if (receiverUser) {
         // External DC user — not provisioned in Serey, sender is from outside
+        console.log(`[IncomingMsg] inbound external mail: ${senderAddr} → serey user "${receiverUser}" (account ${contextId}, chat ${chatId})`);
         const extKey = `${receiverUser}:ext:${senderAddr}`;
         dmKey = extKey;
         dc.rpc.acceptChat(contextId, chatId).catch(() => {});
@@ -524,6 +751,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
             extName: contact.displayName || senderAddr,
             sereAccountId: contextId,
             chatId,
+            securejoinDone: true, // inbound mail proves keys are exchanged
             createdAt: Date.now(),
             lastMessage: null,
             lastMessageAt: 0,
@@ -531,19 +759,35 @@ dc.on('IncomingMsg', async (contextId, event) => {
           });
           console.log(`[IncomingMsg] created external DM ${extKey}`);
           sseBroadcast(`user:${receiverUser}`, { type: 'new_dm', dmKey: extKey, otherUser: senderAddr });
-        } else if (existingExtDm.chatId !== chatId) {
+        } else if (existingExtDm.chatId !== chatId || !existingExtDm.securejoinDone) {
           // Securejoin created a new verified chat — update stored chatId so
-          // dc.getMessageIds uses the correct chat when loading messages.
-          store.setDm(extKey, { ...existingExtDm, chatId });
+          // dc.getMessageIds uses the correct chat when loading messages. Inbound
+          // mail also confirms the key exchange completed. Keep every chatId we've
+          // seen for this contact in chatIds[] so reads cover the split-chat case
+          // even though sends target the single current chatId.
+          const chatIds = new Set(Array.isArray(existingExtDm.chatIds) ? existingExtDm.chatIds : []);
+          if (existingExtDm.chatId) chatIds.add(existingExtDm.chatId);
+          chatIds.add(chatId);
+          store.setDm(extKey, { ...existingExtDm, chatId, chatIds: [...chatIds], securejoinDone: true });
           console.log(`[IncomingMsg] updated dcExternal chatId for ${extKey}: ${existingExtDm.chatId} → ${chatId}`);
         }
+        // Inbound mail means the keys are now present — deliver anything that was
+        // queued before the handshake finished.
+        flushExtSends(extKey).catch(() => {});
       }
     } catch (e) {
       console.error('[IncomingMsg] mobile-sender lookup failed:', e.message);
     }
   }
 
-  if (!orderId && !communityId && !dmKey) return;
+  if (!orderId && !communityId && !dmKey) {
+    // Inbound message we couldn't route to any order/community/DM. Logging it
+    // surfaces mail that silently vanishes (e.g. receiver account not resolved).
+    if (contextId !== botAccountId) {
+      console.warn(`[IncomingMsg] DROPPED unmapped inbound on account ${contextId} (chat ${chatId}, msg ${msgId}) — no order/community/dm match`);
+    }
+    return;
+  }
 
   const chatKey = orderId     ? `order:${orderId}`
                 : communityId ? `community:${communityId}`
@@ -2065,6 +2309,100 @@ app.post('/dm', async (req, res) => {
   }
 });
 
+// ── POST /dm/external ────────────────────────────────────────────────
+// Lets a Serey user initiate a DM to an external Delta Chat user.
+// Body: { serey_username, ext_addr } OR { serey_username, qr_content }
+// qr_content can be an OPENPGP4FPR: securejoin URI or a plain DC email address.
+app.post('/dm/external', async (req, res) => {
+  let { serey_username, ext_addr, qr_content } = req.body;
+
+  // Parse ext_addr from QR/invite content. Both forms carry the address in a=:
+  //   OPENPGP4FPR:FINGERPRINT#a=addr@host&...
+  //   https://i.delta.chat/#FINGERPRINT&...&a=addr%40host&...   (URL-encoded)
+  if (!ext_addr && qr_content) {
+    const raw = String(qr_content).trim();
+    const m = raw.match(/[?&#]a=([^&#\s]+)/i) || raw.match(/^OPENPGP4FPR:[^#]+#a=([^&#\s]+)/i);
+    if (m) {
+      try { ext_addr = decodeURIComponent(m[1]); } catch { ext_addr = m[1]; } // %40 → @
+    } else if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) {
+      ext_addr = raw; // plain email pasted
+    }
+  }
+
+  if (!serey_username) return res.status(400).json({ error: 'serey_username required' });
+  if (!ext_addr) return res.status(400).json({ error: 'ext_addr or valid qr_content required' });
+  ext_addr = ext_addr.trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ext_addr))
+    return res.status(400).json({ error: 'Invalid ext_addr — must be a valid email address' });
+
+  const dmKey = `${serey_username}:ext:${ext_addr}`;
+
+  // Idempotent — return existing DM straight away
+  const existing = store.getDm(dmKey);
+  if (existing?.dcExternal) return res.json({ dmKey, extAddr: ext_addr });
+
+  try {
+    const sereInfo = await ensureUserAccount(serey_username);
+    const sereAccountId = sereInfo.accountId;
+
+    await dc.rpc.startIo(sereAccountId).catch(() => {});
+    ioSendLinger(sereAccountId, QR_IO_LINGER_MS);
+
+    // A securejoin QR can arrive as an OPENPGP4FPR: URI or its https://i.delta.chat/
+    // invite-link equivalent — both carry the i=/s= handshake tokens DC needs.
+    const securejoinQr = (qr_content && /^(OPENPGP4FPR:|https:\/\/i\.delta\.chat\/)/i.test(String(qr_content)))
+      ? String(qr_content)
+      : null;
+
+    // chatId ownership:
+    //  • With a securejoin QR, the handshake itself creates the *verified* chat and
+    //    returns its id. Pre-creating one here with createChatByContactId would spawn
+    //    a SECOND, unverified chat for the same address; the first send could land in
+    //    it and go out unencrypted (chatmail drops cleartext → lost). So we leave
+    //    chatId null and let ensureExtSecurejoin set the verified one.
+    //  • Without a QR (plain email, no handshake possible) we create the chat directly
+    //    for opportunistic encryption — the peer usually has to write first anyway.
+    let chatId = null;
+    if (!securejoinQr) {
+      const contactId = await withTimeout(
+        dc.createContact(sereAccountId, ext_addr, ext_addr), 8_000, 'createContact/external'
+      );
+      chatId = await withTimeout(
+        dc.createChatByContactId(sereAccountId, contactId), 8_000, 'createChatByContactId/external'
+      );
+      await dc.rpc.acceptChat(sereAccountId, chatId).catch(() => {});
+    }
+
+    store.setDm(dmKey, {
+      dcExternal: true,
+      sereUser: serey_username,
+      extAddr: ext_addr,
+      extName: ext_addr,
+      sereAccountId,
+      chatId,
+      securejoinQr,        // kept so the send path can (re)run the handshake if needed
+      securejoinDone: false,
+      createdAt: Date.now(),
+      lastMessage: null,
+      lastMessageAt: 0,
+      lastSeenBy: {},
+    });
+
+    // Kick off the securejoin handshake now. It only completes once the external
+    // contact's device answers (so it may lag if they're offline), but starting
+    // it here means the key is usually ready by the time the first message sends.
+    if (securejoinQr) {
+      ensureExtSecurejoin(dmKey, sereAccountId, securejoinQr).catch(() => {});
+    }
+
+    console.log(`[/dm/external] created — ${dmKey}`);
+    res.json({ dmKey, extAddr: ext_addr });
+  } catch (e) {
+    console.error('[/dm/external]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /dm/:dm_key/send ─────────────────────────────────────────────
 app.post('/dm/:dm_key/send', (req, res, next) => {
   const { dm_key } = req.params;
@@ -2100,19 +2438,12 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
       store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
       res.json({ msgId: localId });
-      (async () => {
-        await dc.rpc.startIo(dm.sereAccountId).catch((e) => console.warn('[ext send] startIo:', e.message));
-        ioSendLinger(dm.sereAccountId);
-        try {
-          const realId = await dc.sendTextMsg(dm.sereAccountId, dm.chatId, text, replyToId);
-          store.replaceDmMessageId(dm_key, localId, realId);
-          markOutgoing(dm.sereAccountId, realId);
-          sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
-        } catch (e) {
-          console.error('[/dm/:key/send ext]', e.message);
-          sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
-        }
-      })();
+      // Queue the message and flush it. If the securejoin key exchange isn't
+      // finished yet (chatmail returns "key is missing"), it stays queued and is
+      // delivered the moment the keys arrive — instead of being lost.
+      queueExtSend(dm_key, { localId, text, replyToId });
+      flushExtSends(dm_key).catch(() => {});
+      scheduleExtFlush(dm_key);
       return;
     }
 
@@ -2256,11 +2587,14 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
         dc.rpc.startIo(sereAccountId).catch(() => {});
         ioSendLinger(sereAccountId, QR_IO_LINGER_MS); // longer linger — IMAP sync is async
       }
-      // Resolve canonical chatId via contact lookup, same as per-user DMs.
-      // After securejoin DC may create a new verified chatId distinct from the
-      // original contact-request chatId that was stored when the DM was created.
-      let resolvedChatId = chatId;
-      if (sereAccountId && extAddr) {
+      // Read from every chat we've associated with this contact. The stored chatId
+      // (set by securejoin / inbound mail) is authoritative for SENDING; we must NOT
+      // overwrite it with createChatByContactId, which points at the old pre-handshake
+      // chat where "key is missing" (the per-user send path documents this same trap).
+      const chatIdSet = new Set([chatId, ...(Array.isArray(dm.chatIds) ? dm.chatIds : [])].filter(Boolean));
+      // Only non-QR (mobile-initiated) DMs lack a securejoin chat — fall back to a
+      // contact lookup to discover it. QR DMs already have the verified chat stored.
+      if (!dm.securejoinQr && sereAccountId && extAddr) {
         const contactId = await withTimeout(
           dc.lookupContactIdByAddr(sereAccountId, extAddr), 6_000, 'ext/lookupContact'
         ).catch(() => 0);
@@ -2268,15 +2602,11 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
           const canonical = await withTimeout(
             dc.createChatByContactId(sereAccountId, contactId), 6_000, 'ext/createChatByContact'
           ).catch(() => 0);
-          if (canonical && canonical !== chatId) {
-            store.setDm(dm_key, { ...dm, chatId: canonical });
-            resolvedChatId = canonical;
-            console.log(`[messages] healed ext chatId ${dm_key}: ${chatId}→${canonical}`);
-          }
+          if (canonical) chatIdSet.add(canonical);
         }
       }
-      // Collect from both stored and resolved chatIds to cover the split-chat case
-      const chatIds = [...new Set([chatId, resolvedChatId].filter(Boolean))];
+      // Collect from all known chatIds to cover the split-chat case.
+      const chatIds = [...chatIdSet];
       const idSets = await Promise.all(
         chatIds.map((cid) => dc.getMessageIds(sereAccountId, cid).catch(() => []))
       );
@@ -2698,6 +3028,8 @@ process.on('uncaughtException', (err) => { console.error(err); shutdown(); proce
 async function start() {
   dc.start();
   await ensureBotAccount();
+  await reconcileAccounts();    // repair stale/duplicate accountId mappings before serving
+  await reconcileExternalDms(); // re-file external DMs that landed under the wrong user
 
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
