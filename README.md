@@ -1,7 +1,7 @@
 # Serey Chat Service
 
 A Node.js / Express microservice that powers the chat features of the Serey
-marketplace. It exposes a REST API and Server-Sent Events (SSE) stream on top of
+platform. It exposes a REST API and Server-Sent Events (SSE) stream on top of
 [Delta Chat](https://delta.chat/) — an email-based, end-to-end encrypted
 messaging protocol — bridging conventional REST clients with the Delta Chat
 network via the `@deltachat/stdio-rpc-server` subprocess.
@@ -14,7 +14,6 @@ network via the `@deltachat/stdio-rpc-server` subprocess.
 - [Getting Started](#getting-started)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
-- [Data Store](#data-store)
 - [Moderation Model](#moderation-model)
 - [Deployment](#deployment)
 - [Utility Scripts](#utility-scripts)
@@ -33,15 +32,12 @@ time.
 
 Three chat types are supported:
 
-- **Order chats** — buyer/seller group chats tied to a marketplace order
-  (`order:<id>`, or `shop_<shopId>_<buyer>` for shop inquiries).
-- **Community groups** — group chats (`community:<id>`) in two sub-types:
-  admin-managed Serey communities (`type: community`) and user-created groups
-  (`type: user`, IDs prefixed `ug_`) that may be public or private.
-- **Direct messages** — 1:1 chats (`dm:<userA>:<userB>`). Each Serey participant
-  owns a dedicated Delta Chat account; securejoin bootstraps key exchange on the
-  first open. External contacts initiated from the Delta Chat mobile app are also
-  supported.
+- **Order chats** — buyer/seller group chats tied to a platform order or shop
+  inquiry.
+- **Community groups** — admin-managed community groups and user-created groups
+  that may be public or private.
+- **Direct messages** — 1:1 conversations between participants, including
+  external contacts initiated from the Delta Chat mobile app.
 
 ## Features
 
@@ -70,31 +66,11 @@ Client -> Express route
 
 ### Real-time events
 
-`sseClients` is an in-memory `Map<chatKey, Set<Response>>`. When a message
-arrives via `dc.on('IncomingMsg', ...)`, it is formatted and broadcast to all SSE
-subscribers for that `chatKey`. Other events map to broadcasts as follows:
-
-| Delta Chat event | SSE broadcast      |
-|------------------|--------------------|
-| `IncomingMsg`    | new message        |
-| `MsgDeleted`     | `message_deleted`  |
-| `MsgsChanged`    | `message_edited`    |
-
-Messages sent by the service are broadcast optimistically with a `localId`,
-followed by a `message_id_updated` event once the real Delta Chat message ID is
-known.
-
-### Message format
-
-Messages routed through the bot carry a prefix so the service can identify the
-sender from Delta Chat events. The `formatMessage()` function in `index.js`
-parses these to extract `senderUsername` and `text`.
-
-```
-(username): text                  Direct message
-Buyer (username): text            Order chat, buyer
-Seller (username): text           Order chat, seller
-```
+Inbound Delta Chat messages are formatted and broadcast over SSE to the clients
+subscribed to that chat. Delivery is optimistic: a message sent through the
+service is echoed to subscribers immediately, then reconciled once the underlying
+message ID is known. Edits and deletions are likewise relayed as their own SSE
+events.
 
 ## Getting Started
 
@@ -263,24 +239,6 @@ the `X-Internal-Token` header.
 | `DELETE` | `/moderation/block`               | Unblock a user.                   |
 | `GET`    | `/moderation/blocks/:username`    | List a user's blocks.             |
 
-## Data Store
-
-State is persisted to `store.json` via a file-backed JSON store (`store.js`).
-Writes are debounced (100 ms) and applied atomically with a `tmp -> actual`
-rename to prevent corruption; `flush()` performs a synchronous write on shutdown.
-
-```js
-{
-  accounts:         { "<username>": { accountId, addr, password } },
-  orderChats:       { "<order_id>": { chatId, buyerUsername, sellerUsername, lastSeenBy } },
-  communityGroups:  { "<community_id>": { chatId, name, type, ownerUsername, roles, mutes, bans, ... } },
-  directMessages:   { "<userA>:<userB>": { ..., messageCache: [...] } },
-  moderation:       { blocks, globalMutes, mutedDms }
-}
-```
-
-See `CLAUDE.md` for the full schema, including external-DM and user-group fields.
-
 ## Moderation Model
 
 Group roles are ranked as follows:
@@ -332,4 +290,4 @@ per-user DM update.
 
 ## License
 
-Proprietary. Part of the Serey marketplace platform.
+Proprietary. Part of the Serey platform.
