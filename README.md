@@ -22,11 +22,14 @@ network via the `@deltachat/stdio-rpc-server` subprocess.
 
 ## Overview
 
-All chats are mediated by a single bot account (`__bot__`) that is
-auto-provisioned on startup through a chatmail QR code. Clients interact with the
-service exclusively over REST and SSE; the service translates those requests into
-Delta Chat RPC calls and relays inbound messages back to subscribed clients in
-real time.
+Order chats and community groups are mediated by a single bot account
+(`__bot__`) that is auto-provisioned on startup through a chatmail QR code.
+Direct messages do not use the bot: each Serey participant has its own dedicated
+Delta Chat account, and DMs are exchanged account-to-account with securejoin
+bootstrapping key exchange on first open. Clients interact with the service
+exclusively over REST and SSE; the service translates those requests into Delta
+Chat RPC calls and relays inbound messages back to subscribed clients in real
+time.
 
 Three chat types are supported:
 
