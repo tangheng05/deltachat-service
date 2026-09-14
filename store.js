@@ -26,6 +26,13 @@
 
 import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
 
+// A DM is unread only when someone else sent the newest message after this user
+// last opened it. Sending a message yourself must never mark the chat unread.
+function isDmUnreadFor(dm, username) {
+  if ((dm.lastMessageAt || 0) <= (dm.lastSeenBy?.[username] || 0)) return false;
+  return dm.lastMessage?.senderUsername !== username;
+}
+
 export class Store {
   constructor(filePath) {
     this.filePath = filePath;
@@ -564,13 +571,13 @@ export class Store {
             userA: username,
             userB: info.extAddr,
             muted: mutedDms.includes(dmKey),
-            unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+            unread: isDmUnreadFor(info, username),
             lastMessage: info.lastMessage || null,
           };
         }
         return {
           dmKey, ...info, muted: mutedDms.includes(dmKey),
-          unread: (info.lastMessageAt || 0) > (info.lastSeenBy?.[username] || 0),
+          unread: isDmUnreadFor(info, username),
           lastMessage: info.lastMessage || null,
         };
       });

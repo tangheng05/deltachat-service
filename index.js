@@ -3082,6 +3082,13 @@ process.on('uncaughtException', (err) => { console.error(err); shutdown(); proce
 // ── Startup ────────────────────────────────────────────────────────────
 async function start() {
   dc.start();
+  // The RPC server opens every account database before answering any request,
+  // which can take minutes with hundreds of accounts. Wait for that here so the
+  // short per-call timeouts below don't kill startup mid-load (which leaves the
+  // child holding accounts.lock and puts pm2 into a restart loop).
+  const dcLoadStart = Date.now();
+  await withTimeout(dc.rpc.getAllAccountIds(), 10 * 60_000, 'dc-rpc ready');
+  console.log(`[dc-rpc] ready after ${Math.round((Date.now() - dcLoadStart) / 1000)}s`);
   await ensureBotAccount();
   await reconcileAccounts();    // repair stale/duplicate accountId mappings before serving
   await reconcileExternalDms(); // re-file external DMs that landed under the wrong user
