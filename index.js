@@ -42,6 +42,30 @@ function withTimeout(promise, ms, label = 'DC operation') {
   ]);
 }
 
+// Loads messages the way the Delta Chat apps do: one getMessages batch per chunk
+// instead of one getMessage round trip per id. Keeps the order of msgIds and drops
+// ids that failed to load (deleted or purged), like the per id path did.
+const MESSAGE_BATCH_SIZE = 200;
+async function loadMessagesById(accountId, msgIds) {
+  const chunks = [];
+  for (let i = 0; i < msgIds.length; i += MESSAGE_BATCH_SIZE) chunks.push(msgIds.slice(i, i + MESSAGE_BATCH_SIZE));
+  const loaded = await mapConcurrent(chunks, async (ids) => {
+    try {
+      const byId = await dc.getMessages(accountId, ids);
+      return ids.map((id) => {
+        const result = byId?.[id];
+        if (!result || result.kind !== 'message') return null;
+        const { kind, ...msg } = result;
+        return msg;
+      });
+    } catch {
+      // The batch call failed as a whole: fall back to one request per id.
+      return mapConcurrent(ids, (id) => dc.getMessage(accountId, id));
+    }
+  }, 4);
+  return loaded.flat().filter(Boolean);
+}
+
 // Limit concurrency for bulk DC calls (getMessage × N)
 async function mapConcurrent(items, fn, concurrency = 8) {
   const results = new Array(items.length);
@@ -254,10 +278,12 @@ async function resolveCanonicalChatId(accountId, otherAddr, dmKey, isUserA) {
   ).catch(() => 0);
   if (!resolved) return 0;
   const dm = store.getDm(dmKey);
-  if (dm) {
-    const updated = addDmChatId(dm, isUserA ? 'A' : 'B', resolved);
-    if (updated !== dm) store.setDm(dmKey, updated);
-  }
+  // addDmChatId always returns a new object, so compare first. Saving on every
+  // history load would rewrite the whole store file each time a chat is opened.
+  const primaryKey = isUserA ? 'userAChatId' : 'userBChatId';
+  const listKey = isUserA ? 'userAChatIds' : 'userBChatIds';
+  const alreadyKnown = dm && dm[primaryKey] === resolved && (dm[listKey] || []).includes(resolved);
+  if (dm && !alreadyKnown) store.setDm(dmKey, addDmChatId(dm, isUserA ? 'A' : 'B', resolved));
   return resolved;
 }
 
@@ -2623,8 +2649,8 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
     if (dm.chatId && !dm.userAAccountId && !dm.dcExternal) {
       const botId  = await ensureBotAccount();
       const msgIds = await dc.getMessageIds(botId, dm.chatId);
-      const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id)))
-        .filter(Boolean).map(formatMessage);
+      const messages = (await loadMessagesById(botId, msgIds))
+        .map(formatMessage);
       if (!dm.lastMessage) {
         const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
         if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
@@ -2663,8 +2689,8 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
         chatIds.map((cid) => dc.getMessageIds(sereAccountId, cid).catch(() => []))
       );
       const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
-      const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(sereAccountId, id)))
-        .filter(Boolean).map((msg) => formatDmMessage(msg, dm, sereUser));
+      const messages = (await loadMessagesById(sereAccountId, msgIds))
+        .map((msg) => formatDmMessage(msg, dm, sereUser));
       const cachedMessages = store.getDmCachedMessages(dm_key);
       const mergedMessages = mergeDmMessages(messages, cachedMessages);
       if (!dm.lastMessage) {
@@ -2708,8 +2734,8 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
       chatIds.map((cid) => dc.getMessageIds(accountId, cid).catch(() => []))
     );
     const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
-    const messages = (await mapConcurrent(msgIds, (id) => dc.getMessage(accountId, id)))
-      .filter(Boolean).map((msg) => formatDmMessage(msg, dm, viewerUser));
+    const messages = (await loadMessagesById(accountId, msgIds))
+      .map((msg) => formatDmMessage(msg, dm, viewerUser));
 
     const cachedMessages = store.getDmCachedMessages(dm_key);
     const mergedMessages = mergeDmMessages(messages, cachedMessages);

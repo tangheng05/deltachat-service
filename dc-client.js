@@ -108,6 +108,9 @@ export class DeltaChatClient extends EventEmitter {
 
   getMessage(accountId, msgId) { return this._dc.rpc.getMessage(accountId, msgId); }
 
+  // Batch variant of getMessage. Resolves to { [msgId]: { kind: 'message', ...msg } | { kind: 'loadingError', error } }.
+  getMessages(accountId, msgIds) { return this._dc.rpc.getMessages(accountId, msgIds); }
+
   getMessageIds(accountId, chatId) {
     return this._dc.rpc.getMessageIds(accountId, chatId, false, false);
   }
