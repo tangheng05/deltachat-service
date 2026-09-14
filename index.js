@@ -819,7 +819,9 @@ dc.on('IncomingMsg', async (contextId, event) => {
       formatted = formatMessage(msg);
     }
 
-    sseBroadcast(chatKey, formatted);
+    // Both DM participants share the dm:<key> channel and message ids are per-account,
+    // so tag which participant's account this copy (and its id) belongs to.
+    sseBroadcast(chatKey, dmKey && formatted ? { ...formatted, forUser: dmAccountOwner(store.getDm(dmKey), contextId) } : formatted);
 
     if (dmKey && formatted && !formatted.isSystem) {
       store.addDmMessage(dmKey, formatted);
@@ -886,7 +888,9 @@ dc.on('MsgDeleted', (contextId, event) => {
     if (!chatKey) return;
 
     if (dmKey) store.removeDmCachedMessage(dmKey, msgId);
-    sseBroadcast(chatKey, { type: 'message_deleted', id: msgId });
+    const payload = { type: 'message_deleted', id: msgId };
+    if (dmKey) payload.forUser = dmAccountOwner(store.getDm(dmKey), contextId);
+    sseBroadcast(chatKey, payload);
   } catch (e) {
     console.error('[MsgDeleted]', e.message);
   }
@@ -912,7 +916,7 @@ dc.on('MsgsChanged', async (contextId, event) => {
     if (!formatted || formatted.isSystem) return;
 
     store.updateDmCachedMessage(dmKey, msgId, { text: formatted.text });
-    sseBroadcast(`dm:${dmKey}`, { type: 'message_edited', ...formatted });
+    sseBroadcast(`dm:${dmKey}`, { type: 'message_edited', ...formatted, forUser: dmAccountOwner(dm, contextId) });
   } catch (e) {
     console.error('[MsgsChanged]', e.message);
   }
@@ -993,38 +997,86 @@ function formatDmMessage(msg, dm, viewerUsername) {
   };
 }
 
-function dmMessageKey(msg) {
-  const sender = msg?.senderUsername ?? '';
-  const ts = msg?.timestamp ?? 0;
-  const text = msg?.text ?? '';
-  return `${sender}|${ts}|${text}`;
+// Which Serey participant owns DC account `accountId` in this DM (null if neither).
+function dmAccountOwner(dm, accountId) {
+  if (!dm) return null;
+  if (dm.dcExternal) return dm.sereAccountId === accountId ? dm.sereUser : null;
+  if (dm.userAAccountId === accountId) return dm.userA;
+  if (dm.userBAccountId === accountId) return dm.userB;
+  return null;
 }
 
+// DC message IDs are per-account, so the shared DM cache holds one copy of each
+// message per account that saw it: the sender's copy from the send route
+// (server-clock timestamp, sender-account id, no chatId) and the recipient's copy
+// from IncomingMsg (DC timestamp, recipient-account id, has chatId). The send route
+// can wait minutes for key exchange before DC creates the message, so the two
+// timestamps can be far apart.
+const DM_PAIR_WINDOW_S = 600; // sender copy ↔ recipient copy
+const DM_DUP_WINDOW_S = 120;  // DC message ↔ cached copy whose id doesn't match
+
+function sameSenderText(a, b) {
+  return (a.senderUsername ?? '') === (b.senderUsername ?? '') && (a.text ?? '') === (b.text ?? '');
+}
+
+const tsDiff = (a, b) => Math.abs((a.timestamp || 0) - (b.timestamp || 0));
+
 function mergeDmMessages(dcMessages, cachedMessages) {
-  const byKey = new Map();
-  for (const msg of cachedMessages || []) {
-    byKey.set(dmMessageKey(msg), msg);
+  const cached = cachedMessages || [];
+
+  // 1. Pair each recipient copy with its sender copy, closest timestamps first and
+  //    one-to-one so repeated identical texts keep every message. The sender copy
+  //    is kept and also answers to the recipient copy's id.
+  const pairs = [];
+  cached.forEach((r, i) => {
+    if (r.chatId == null) return;
+    cached.forEach((s, j) => {
+      if (s.chatId == null && sameSenderText(r, s) && tsDiff(r, s) <= DM_PAIR_WINDOW_S) pairs.push([tsDiff(r, s), i, j]);
+    });
+  });
+  pairs.sort((a, b) => a[0] - b[0]);
+  const used = new Set();
+  const altId = new Map(); // sender copy index → recipient copy id
+  for (const [, i, j] of pairs) {
+    if (used.has(i) || used.has(j)) continue;
+    used.add(i);
+    used.add(j);
+    altId.set(j, cached[i].id);
   }
+  const entries = [];
+  cached.forEach((m, k) => {
+    if (m.chatId != null && used.has(k)) return;
+    entries.push({ msg: m, ids: altId.has(k) ? [m.id, altId.get(k)] : [m.id] });
+  });
+
+  // 2. DC is authoritative for the viewer's account — each DC message replaces its cached copy.
+  const claimed = new Set();
+  const free = (k) => !claimed.has(k);
+  const merged = [];
   for (const msg of dcMessages || []) {
-    const key = dmMessageKey(msg);
-    if (!byKey.has(key)) {
-      // Evict stale cache entries — covers two cases:
-      // 1. Same ID, different key (timestamp drift)
-      // 2. Same sender+timestamp, different text (message was edited)
-      const senderTs = `${msg.senderUsername ?? ""}|${msg.timestamp ?? 0}|`;
-      for (const [k, m] of byKey) {
-        if ((msg.id != null && m.id === msg.id) || k.startsWith(senderTs)) {
-          byKey.delete(k);
-          break;
-        }
-      }
+    // Same id (from either account's copy), else same sender+text at a nearby time.
+    let j = msg.id == null ? -1 : entries.findIndex((e, k) => free(k) && e.ids.includes(msg.id) && sameSenderText(e.msg, msg));
+    if (j === -1) {
+      let bestDiff = Infinity;
+      entries.forEach((e, k) => {
+        const diff = tsDiff(e.msg, msg);
+        if (free(k) && sameSenderText(e.msg, msg) && diff <= DM_DUP_WINDOW_S && diff < bestDiff) { j = k; bestDiff = diff; }
+      });
     }
-    // DC entry always wins for ID/text — authoritative for viewer's account.
     // Preserve isEdited:true from cache: DC may not set it on the sender's copy immediately.
-    const cachedIsEdited = byKey.get(key)?.isEdited === true;
-    byKey.set(key, { ...msg, isEdited: msg.isEdited || cachedIsEdited || editedMsgIds.has(msg.id) });
+    const cachedIsEdited = j !== -1 && entries[j].msg.isEdited === true;
+    if (j === -1) {
+      // Edited message: same sender and id/timestamp, but the cached text is stale.
+      j = entries.findIndex((e, k) => free(k)
+        && (e.msg.senderUsername ?? '') === (msg.senderUsername ?? '')
+        && ((msg.id != null && e.ids.includes(msg.id)) || (e.msg.timestamp ?? 0) === (msg.timestamp ?? 0)));
+    }
+    if (j !== -1) claimed.add(j);
+    merged.push({ ...msg, isEdited: msg.isEdited || cachedIsEdited || editedMsgIds.has(msg.id) });
   }
-  return [...byKey.values()].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
+  entries.forEach((e, k) => { if (free(k)) merged.push(e.msg); });
+
+  return merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
 }
 
 // ── Express ──────────────────────────────────────────────────────────
@@ -2805,7 +2857,9 @@ app.delete('/dm/:dm_key/messages/:message_id', async (req, res) => {
       console.warn('[/dm/:key/messages/:id DELETE] DC already purged Msg#' + msgIdNum + ', cleaning cache');
     }
     store.removeDmCachedMessage(dm_key, msgIdNum);
-    sseBroadcast(`dm:${dm_key}`, { type: 'message_deleted', id: msgIdNum });
+    // Legacy bot DMs share one account's ids, so only per-account DMs are tagged.
+    const forUser = dm.userAAccountId || dm.dcExternal ? sender_username : null;
+    sseBroadcast(`dm:${dm_key}`, { type: 'message_deleted', id: msgIdNum, forUser });
     res.json({ success: true });
   } catch (e) {
     console.error('[/dm/:key/messages/:id DELETE]', e.message);
@@ -2847,7 +2901,8 @@ app.patch('/dm/:dm_key/messages/:message_id', async (req, res) => {
     editedMsgIds.add(msgIdNum);
 
     store.updateDmCachedMessage(dm_key, msgIdNum, { text: text.trim(), isEdited: true });
-    sseBroadcast(`dm:${dm_key}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username, isEdited: true });
+    const forUser = dm.userAAccountId || dm.dcExternal ? sender_username : null;
+    sseBroadcast(`dm:${dm_key}`, { type: 'message_edited', id: msgIdNum, text: text.trim(), senderUsername: sender_username, isEdited: true, forUser });
     res.json({ success: true });
   } catch (e) {
     console.error('[/dm/:key/messages/:id PATCH]', e.message);
