@@ -66,6 +66,46 @@ async function loadMessagesById(accountId, msgIds) {
   return loaded.flat().filter(Boolean);
 }
 
+const PAGE_DEFAULT = 100;
+const PAGE_MAX = 500;
+
+function pageOpts(query) {
+  const limit = Math.min(Math.max(parseInt(query.limit) || PAGE_DEFAULT, 1), PAGE_MAX);
+  const before = parseInt(query.before) || 0;
+  return { limit, before };
+}
+
+// DC message ids are per-account autoincrement, so numeric order is chronological
+// and `before` works as a stable cursor.
+function pageIds(ids, { limit, before }) {
+  const sorted = [...new Set(ids)].sort((a, b) => a - b);
+  const eligible = before ? sorted.filter((id) => id < before) : sorted;
+  const page = eligible.slice(-limit);
+  const hasMore = page.length < eligible.length;
+  return { page, hasMore, nextBefore: hasMore ? page[0] : null };
+}
+
+// Reads a bot chat's message ids without ever repointing the chat. A timeout or
+// RPC hiccup (common while the RPC server is busy after a restart) is reported as
+// 503 so the client retries; a chat DC confirms is gone yields an empty list.
+async function readBotChatIds(botId, chatId, ms, tag, id) {
+  try {
+    return await withTimeout(dc.getMessageIds(botId, chatId), ms, 'getMessageIds');
+  } catch (e) {
+    const timedOut = /timed out/.test(e.message);
+    const missing = !timedOut && await dc.rpc.getBasicChatInfo(botId, chatId).then(() => false, () => true);
+    if (missing) {
+      console.error(`${tag} chat ${chatId} for ${id} no longer exists in DC — returning empty, NOT recreating`);
+      return [];
+    }
+    console.warn(`${tag} getMessageIds failed for ${id} (chat ${chatId}): ${e.message}`);
+    throw Object.assign(new Error('Chat service busy, retry'), { status: 503 });
+  }
+}
+
+const chronological = (messages) =>
+  messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || (a.id || 0) - (b.id || 0));
+
 // Limit concurrency for bulk DC calls (getMessage × N)
 async function mapConcurrent(items, fn, concurrency = 8) {
   const results = new Array(items.length);
@@ -1301,23 +1341,14 @@ app.get('/messages', async (req, res) => {
     if (!chat) return res.json({ messages: [] });
 
     const botId = await ensureBotAccount();
-    let msgIds;
-    try {
-      msgIds = await withTimeout(dc.getMessageIds(botId, chat.chatId), 5_000, 'getMessageIds');
-    } catch (_) {
-      const newChatId = await dc.createGroupChat(botId, `Order #${order_id}`);
-      store.setOrderChat(order_id, { ...chat, chatId: newChatId });
-      console.log(`[orders] healed stale chatId for order ${order_id} → ${newChatId}`);
-      msgIds = [];
-    }
-    const messages = (
-      await mapConcurrent(msgIds, (id) => dc.getMessage(botId, id))
-    ).filter(Boolean).map(formatMessage);
+    const msgIds = await readBotChatIds(botId, chat.chatId, 5_000, '[orders]', `order ${order_id}`);
+    const { page, hasMore, nextBefore } = pageIds(msgIds, pageOpts(req.query));
+    const messages = chronological((await loadMessagesById(botId, page)).map(formatMessage));
 
-    res.json({ messages, lastSeenBy: chat.lastSeenBy || {} });
+    res.json({ messages, lastSeenBy: chat.lastSeenBy || {}, hasMore, nextBefore });
   } catch (e) {
     console.error('[/messages]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -1722,36 +1753,25 @@ app.post('/groups/:community_id/send',
 // ── GET /groups/:community_id/messages ────────────────────────────────
 app.get('/groups/:community_id/messages', async (req, res) => {
   const { community_id } = req.params;
-  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
 
   try {
     const group = store.getCommunityGroup(community_id);
-    if (!group) return res.json({ messages: [] });
+    if (!group) return res.json({ messages: [], hasMore: false, nextBefore: null });
 
     const botId = await ensureBotAccount();
-    let msgIds;
-    try {
-      msgIds = await withTimeout(dc.getMessageIds(botId, group.chatId), 8_000, 'getMessageIds');
-    } catch (_) {
-      const newChatId = await dc.createGroupChat(botId, `${group.name || community_id} Community`);
-      store.setCommunityGroup(community_id, { ...store.getCommunityGroup(community_id), chatId: newChatId });
-      console.log(`[groups] healed stale chatId for community ${community_id} → ${newChatId}`);
-      msgIds = [];
-    }
-    const recent = msgIds.slice(-limit);
-    const messages = (
-      await mapConcurrent(recent, (id) => dc.getMessage(botId, id))
-    ).filter(Boolean).map(formatMessage);
+    const msgIds = await readBotChatIds(botId, group.chatId, 8_000, '[groups]', `community ${community_id}`);
+    const { page, hasMore, nextBefore } = pageIds(msgIds, pageOpts(req.query));
+    const messages = chronological((await loadMessagesById(botId, page)).map(formatMessage));
 
     if (!group.lastMessage) {
       const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
       if (last) store.setGroupLastMessage(community_id, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
     }
 
-    res.json({ messages });
+    res.json({ messages, hasMore, nextBefore });
   } catch (e) {
     console.error('[/groups/:id/messages]', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -2638,24 +2658,57 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
 });
 
 // ── GET /dm/:dm_key/messages ──────────────────────────────────────────
+// Loads one page of a DM from every chatId known for the viewer's account. The
+// initial page is merged with the whole shared cache (a local read, capped at 500,
+// and it may hold copies this account never received); scroll-back pages come
+// from DC only, since cache ids belong to either account and can't be compared
+// to `before`.
+async function loadDmPage(accountId, chatIds, dmKey, dm, viewerUser, opts) {
+  const idSets = await Promise.all(
+    chatIds.map((cid) => dc.getMessageIds(accountId, cid).catch(() => []))
+  );
+  const { page, hasMore, nextBefore } = pageIds(idSets.flat(), opts);
+  const messages = (await loadMessagesById(accountId, page))
+    .map((msg) => formatDmMessage(msg, dm, viewerUser));
+  if (opts.before) return { messages: chronological(messages), hasMore, nextBefore };
+
+  const merged = mergeDmMessages(messages, store.getDmCachedMessages(dmKey));
+  if (!dm.lastMessage) {
+    const last = [...merged].reverse().find((m) => m.text && !m.isSystem);
+    if (last) store.setDmLastMessage(dmKey, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
+  }
+  if (!hasMore) return { messages: merged, hasMore, nextBefore };
+
+  // DC has older history: cache entries older than this page belong to it and
+  // would come back as duplicates (under the other account's id) on scroll-back.
+  const dcIds = new Set(messages.map((m) => m.id));
+  const oldestTs = Math.min(...messages.map((m) => m.timestamp || Infinity));
+  return {
+    messages: merged.filter((m) => dcIds.has(m.id) || (m.timestamp || 0) >= oldestTs),
+    hasMore,
+    nextBefore,
+  };
+}
+
 app.get('/dm/:dm_key/messages', async (req, res) => {
   const { dm_key } = req.params;
   const { username } = req.query;
+  const opts = pageOpts(req.query);
   try {
     const dm = store.getDm(dm_key);
-    if (!dm) return res.json({ messages: [], lastSeenBy: {} });
+    if (!dm) return res.json({ messages: [], lastSeenBy: {}, hasMore: false, nextBefore: null });
 
     // Legacy bot-DM fallback
     if (dm.chatId && !dm.userAAccountId && !dm.dcExternal) {
       const botId  = await ensureBotAccount();
       const msgIds = await dc.getMessageIds(botId, dm.chatId);
-      const messages = (await loadMessagesById(botId, msgIds))
-        .map(formatMessage);
+      const { page, hasMore, nextBefore } = pageIds(msgIds, opts);
+      const messages = chronological((await loadMessagesById(botId, page)).map(formatMessage));
       if (!dm.lastMessage) {
         const last = [...messages].reverse().find((m) => m.text && !m.isSystem);
         if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp || Math.floor(Date.now() / 1000) });
       }
-      return res.json({ messages, lastSeenBy: dm.lastSeenBy || {} });
+      return res.json({ messages, lastSeenBy: dm.lastSeenBy || {}, hasMore, nextBefore });
     }
 
     // External DC user DM — read from sereAccountId/chatId
@@ -2684,20 +2737,8 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
         }
       }
       // Collect from all known chatIds to cover the split-chat case.
-      const chatIds = [...chatIdSet];
-      const idSets = await Promise.all(
-        chatIds.map((cid) => dc.getMessageIds(sereAccountId, cid).catch(() => []))
-      );
-      const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
-      const messages = (await loadMessagesById(sereAccountId, msgIds))
-        .map((msg) => formatDmMessage(msg, dm, sereUser));
-      const cachedMessages = store.getDmCachedMessages(dm_key);
-      const mergedMessages = mergeDmMessages(messages, cachedMessages);
-      if (!dm.lastMessage) {
-        const last = [...mergedMessages].reverse().find((m) => m.text && !m.isSystem);
-        if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
-      }
-      return res.json({ messages: mergedMessages, lastSeenBy: dm.lastSeenBy || {} });
+      const { messages, hasMore, nextBefore } = await loadDmPage(sereAccountId, [...chatIdSet], dm_key, dm, sereUser, opts);
+      return res.json({ messages, lastSeenBy: dm.lastSeenBy || {}, hasMore, nextBefore });
     }
 
     // Per-user: read from the requesting user's side
@@ -2730,22 +2771,9 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
 
     // Collect from all known chatIds to cover the split-chat case
     const chatIds = [...new Set([chatId, canonicalChatId, ...storedList].filter((cid) => cid))];
-    const idSets = await Promise.all(
-      chatIds.map((cid) => dc.getMessageIds(accountId, cid).catch(() => []))
-    );
-    const msgIds = [...new Map(idSets.flat().map((id) => [id, id])).values()];
-    const messages = (await loadMessagesById(accountId, msgIds))
-      .map((msg) => formatDmMessage(msg, dm, viewerUser));
+    const { messages, hasMore, nextBefore } = await loadDmPage(accountId, chatIds, dm_key, dm, viewerUser, opts);
 
-    const cachedMessages = store.getDmCachedMessages(dm_key);
-    const mergedMessages = mergeDmMessages(messages, cachedMessages);
-
-    if (!dm.lastMessage) {
-      const last = [...mergedMessages].reverse().find((m) => m.text && !m.isSystem);
-      if (last) store.setDmLastMessage(dm_key, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
-    }
-
-    res.json({ messages: mergedMessages, lastSeenBy: dm.lastSeenBy || {} });
+    res.json({ messages, lastSeenBy: dm.lastSeenBy || {}, hasMore, nextBefore });
   } catch (e) {
     console.error('[/dm/:key/messages]', e.message);
     res.status(500).json({ error: e.message });

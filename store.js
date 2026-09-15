@@ -564,7 +564,7 @@ export class Store {
     const mutedDms = this.data.moderation.mutedDms[username] ?? [];
     return Object.entries(this.data.directMessages)
       .filter(([, info]) => info.userA === username || info.userB === username || info.sereUser === username)
-      .map(([dmKey, info]) => {
+      .map(([dmKey, { messageCache, ...info }]) => {
         if (info.dcExternal) {
           return {
             dmKey, ...info,
