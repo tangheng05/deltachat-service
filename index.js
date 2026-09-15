@@ -2856,7 +2856,7 @@ app.post('/dm/:dm_key/seen', (req, res) => {
   const isParticipant = dm.dcExternal ? dm.sereUser === username : (dm.userA === username || dm.userB === username);
   if (!isParticipant) return res.status(403).json({ error: 'Not a participant' });
   const nowSec = Math.floor(Date.now() / 1000);
-  store.setDmLastSeen(dm_key, username, nowSec);
+  store.setDmLastSeen(dm_key, username, Math.max(nowSec, dm.lastMessageAt || 0));
   sseBroadcast(`dm:${dm_key}`, { type: 'seen', username, seenAt: nowSec });
   res.json({ ok: true });
 });
@@ -2870,8 +2870,10 @@ app.post('/groups/:community_id/seen', (req, res) => {
   if (!group) return res.status(404).json({ error: 'Group not found' });
   if (!group.memberUsernames.includes(username)) return res.status(403).json({ error: 'Not a member' });
   const nowSec = Math.floor(Date.now() / 1000);
-  store.setGroupLastSeen(community_id, username, nowSec);
-  sseBroadcast(`community:${community_id}`, { type: 'seen', username, seenAt: nowSec });
+
+  const seenAt = Math.max(nowSec, group.lastMessage?.timestamp || 0);
+  store.setGroupLastSeen(community_id, username, seenAt);
+  sseBroadcast(`community:${community_id}`, { type: 'seen', username, seenAt });
   res.json({ ok: true });
 });
 
