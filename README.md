@@ -1,20 +1,27 @@
 # Chat Service
 
-A small Node.js service that gives a marketplace real time chat without running its own messaging backend. It exposes a plain REST API and a Server Sent Events stream, and underneath it uses [Delta Chat](https://delta.chat/), an email based protocol with end to end encryption built in. Clients only ever talk to this service. The service takes care of accounts, chats, message delivery, moderation and live updates.
+A Node.js service that gives an application private, end to end encrypted direct messaging. It speaks a plain REST API and a Server Sent Events stream to your clients, and [Delta Chat](https://delta.chat/) underneath. Delta Chat is an email based messaging protocol, so every conversation is encrypted, carried over ordinary mail infrastructure, and reachable from the Delta Chat mobile apps. Your clients never see any of that. They call REST endpoints and listen for events.
 
-## What it does
+## Direct messages
 
-The service supports three kinds of conversation.
+Direct messages are the heart of the service. Every user gets their own Delta Chat account, created on demand, so a conversation runs account to account between the two people in it rather than through a shared relay. Nothing in the middle can read it.
+
+Opening a conversation is a single call to `POST /dm`. The service provisions whatever accounts are missing, runs the securejoin handshake that exchanges keys the first time two people talk, and returns a conversation key you use for everything after that: sending, fetching history, subscribing to live events, marking as seen, muting, editing and deleting.
+
+Because each user is a real Delta Chat account, conversations are not limited to your own users. Someone running the Delta Chat app can message a user directly, and that conversation shows up through the same endpoints as any other, marked as an outside contact.
+
+Recent messages for each conversation are cached in the store, so history loads without waiting on the mail layer.
+
+## Other conversation types
+
+The same service also carries two group shaped chat types, both run through a single bot account that is created on first start.
 
 | Type | Description |
 |------|-------------|
-| Order chats | A private chat between a buyer and a seller, tied to an order or a shop inquiry. |
 | Groups | Community groups managed by an administrator, plus groups that any user can create. Groups can be open or require approval, and user groups can be public or private. |
-| Direct messages | One to one conversations between two users. Each user has their own dedicated messaging account, so these chats are exchanged directly between accounts. Contacts from the Delta Chat mobile app can also reach a user this way. |
+| Order chats | A private chat tied to a transaction, opened between the two people involved. Used by the commerce side of the application. |
 
-Order chats and groups are run through a single bot account that the service creates on its first start. Direct messages do not go through the bot.
-
-On top of messaging, the service provides:
+## What else it handles
 
 1. Live delivery over Server Sent Events. A message you send is echoed back to subscribers right away, then reconciled once the real message ID is known. Edits and deletions are pushed as their own events.
 2. Group moderation with roles, mutes, bans, kicks, join approvals, invite links and an announcement only mode.
@@ -84,6 +91,23 @@ All endpoints accept and return JSON. Endpoints marked internal require the `X-I
 | `GET` | `/accounts/:username` | Account details. |
 | `GET` | `/accounts/:username/qr` | Invite QR code for the account. |
 | `GET` | `/accounts/:username/key` | Account key material (internal). |
+
+### Direct messages
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/dm` | Open or look up a conversation between two users. |
+| `POST` | `/dm/external` | Open a conversation with an outside contact. |
+| `GET` | `/dm/user/:username` | Conversations a user is part of. |
+| `POST` | `/dm/:dm_key/send` | Send a message. |
+| `GET` | `/dm/:dm_key/messages` | Fetch messages. |
+| `PATCH` | `/dm/:dm_key/messages/:message_id` | Edit a message. |
+| `DELETE` | `/dm/:dm_key/messages/:message_id` | Delete a message. |
+| `GET` | `/dm/:dm_key/events` | Live event stream for the conversation. |
+| `POST` | `/dm/:dm_key/seen` | Mark the conversation as seen. |
+| `POST` | `/dm/:dm_key/mute` | Mute the conversation. |
+| `DELETE` | `/dm/:dm_key/mute` | Unmute the conversation. |
+| `DELETE` | `/dm/:dm_key` | Delete the conversation. |
 
 ### Order chats
 
@@ -165,23 +189,6 @@ All endpoints accept and return JSON. Endpoints marked internal require the `X-I
 | `GET` | `/user-groups/:username` | Groups a user belongs to. |
 | `PATCH` | `/user-groups/:group_id` | Update a user group. |
 | `DELETE` | `/user-groups/:group_id` | Delete a user group. |
-
-### Direct messages
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/dm` | Open or look up a conversation between two users. |
-| `POST` | `/dm/external` | Open a conversation with an outside contact. |
-| `GET` | `/dm/user/:username` | Conversations a user is part of. |
-| `POST` | `/dm/:dm_key/send` | Send a message. |
-| `GET` | `/dm/:dm_key/messages` | Fetch messages. |
-| `PATCH` | `/dm/:dm_key/messages/:message_id` | Edit a message. |
-| `DELETE` | `/dm/:dm_key/messages/:message_id` | Delete a message. |
-| `GET` | `/dm/:dm_key/events` | Live event stream for the conversation. |
-| `POST` | `/dm/:dm_key/seen` | Mark the conversation as seen. |
-| `POST` | `/dm/:dm_key/mute` | Mute the conversation. |
-| `DELETE` | `/dm/:dm_key/mute` | Unmute the conversation. |
-| `DELETE` | `/dm/:dm_key` | Delete the conversation. |
 
 ### Blocking
 
