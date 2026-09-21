@@ -2,8 +2,10 @@
   "name": "serey-chat-service",
   "version": "1.0.0",
   "type": "module",
-  "description": "Delta Chat microservice for Serey Market order chat and community groups",
+  "description": "Encrypted direct messaging over Delta Chat, exposed as a REST and Server Sent Events API, with group chats and moderation built in",
   "main": "index.js",
+  "private": true,
+  "license": "UNLICENSED",
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js"

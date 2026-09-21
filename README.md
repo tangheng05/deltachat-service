@@ -240,4 +240,8 @@ Run any of them with `node <script>.js`.
 
 ## License
 
-Proprietary.
+Proprietary. All rights reserved. The source code is confidential and may not be
+copied, modified, distributed or used without prior written permission from the
+copyright holder. Having access to the code does not grant a license to use it
+beyond the purpose that access was given for. See [LICENSE](LICENSE) for the full
+terms.
