@@ -1,294 +1,236 @@
-# Serey Chat Service
+# Chat Service
 
-A Node.js / Express microservice that powers the chat features of the Serey
-platform. It exposes a REST API and Server-Sent Events (SSE) stream on top of
-[Delta Chat](https://delta.chat/) — an email-based, end-to-end encrypted
-messaging protocol — bridging conventional REST clients with the Delta Chat
-network via the `@deltachat/stdio-rpc-server` subprocess.
+A small Node.js service that gives a marketplace real time chat without running its own messaging backend. It exposes a plain REST API and a Server Sent Events stream, and underneath it uses [Delta Chat](https://delta.chat/), an email based protocol with end to end encryption built in. Clients only ever talk to this service. The service takes care of accounts, chats, message delivery, moderation and live updates.
 
-## Table of Contents
+## What it does
 
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [Configuration](#configuration)
-- [API Reference](#api-reference)
-- [Moderation Model](#moderation-model)
-- [Deployment](#deployment)
-- [Utility Scripts](#utility-scripts)
-- [Project Structure](#project-structure)
+The service supports three kinds of conversation.
 
+| Type | Description |
+|------|-------------|
+| Order chats | A private chat between a buyer and a seller, tied to an order or a shop inquiry. |
+| Groups | Community groups managed by an administrator, plus groups that any user can create. Groups can be open or require approval, and user groups can be public or private. |
+| Direct messages | One to one conversations between two users. Each user has their own dedicated messaging account, so these chats are exchanged directly between accounts. Contacts from the Delta Chat mobile app can also reach a user this way. |
 
-## Overview
+Order chats and groups are run through a single bot account that the service creates on its first start. Direct messages do not go through the bot.
 
-Order chats and community groups are mediated by a single bot account
-(`__bot__`) that is auto-provisioned on startup through a chatmail QR code.
-Direct messages do not use the bot: each Serey participant has its own dedicated
-Delta Chat account, and DMs are exchanged account-to-account with securejoin
-bootstrapping key exchange on first open. Clients interact with the service
-exclusively over REST and SSE; the service translates those requests into Delta
-Chat RPC calls and relays inbound messages back to subscribed clients in real
-time.
+On top of messaging, the service provides:
 
-Three chat types are supported:
+1. Live delivery over Server Sent Events. A message you send is echoed back to subscribers right away, then reconciled once the real message ID is known. Edits and deletions are pushed as their own events.
+2. Group moderation with roles, mutes, bans, kicks, join approvals, invite links and an announcement only mode.
+3. Rate limiting per user and per chat, and detection of repeated spam messages.
+4. Block lists, global mutes and per conversation mutes.
+5. A simple JSON store on disk with debounced, atomic writes.
 
-- **Order chats** — buyer/seller group chats tied to a platform order or shop
-  inquiry.
-- **Community groups** — admin-managed community groups and user-created groups
-  that may be public or private.
-- **Direct messages** — 1:1 conversations between participants, including
-  external contacts initiated from the Delta Chat mobile app.
+## How it works
 
-## Features
-
-- REST API covering accounts, chats, messaging, groups, direct messages, and
-  moderation.
-- Real-time delivery over Server-Sent Events with optimistic local echo and
-  message-ID reconciliation.
-- End-to-end encryption inherited from the Delta Chat protocol.
-- Group moderation: roles, mutes, bans, kicks, join approvals, invite links, and
-  announcement mode.
-- Per-user, per-chat rate limiting and repeated-message spam detection.
-- Block lists and global / per-DM mutes.
-- File-backed JSON store with debounced, atomic writes.
-
-## Architecture
-
-### Request lifecycle
+Every request follows the same path.
 
 ```
-Client -> Express route
-  -> middleware (blockCheck -> rateLimiter -> spamFilter -> groupGuard -> requireRole)
-  -> store.js        (read / write metadata in store.json)
-  -> dc-client.js    (Delta Chat RPC: send / receive, manage chats)
-  -> SSE broadcast   (push to connected clients)
+Client
+  -> Express route
+  -> middleware (block check, rate limit, spam filter, group guard, role check)
+  -> store.js      reads and writes chat metadata in store.json
+  -> dc-client.js  talks to the Delta Chat RPC process
+  -> SSE broadcast pushes the result to connected clients
 ```
 
-### Real-time events
+Incoming messages arrive through the Delta Chat event stream, are parsed into a clean shape with the sender and text, and are broadcast to whoever is subscribed to that chat.
 
-Inbound Delta Chat messages are formatted and broadcast over SSE to the clients
-subscribed to that chat. Delivery is optimistic: a message sent through the
-service is echoed to subscribers immediately, then reconciled once the underlying
-message ID is known. Edits and deletions are likewise relayed as their own SSE
-events.
+## Getting started
 
-## Getting Started
-
-### Prerequisites
-
-- Node.js 20 or later
-- A reachable chatmail server (the public `nine.testrun.org` works with zero
-  setup for development)
-
-### Installation
+You need Node.js 20 or newer and a reachable chatmail server. The public server at `nine.testrun.org` works for development with no setup at all.
 
 ```bash
 npm install
+cp .env.example .env
+npm run dev
 ```
 
-### Running
+`npm run dev` restarts the service automatically when a file changes. Use `npm start` in production.
 
-```bash
-npm run dev      # Development mode with auto-reload (node --watch)
-npm start        # Production start
-```
+Once it is running, `GET /health` returns the service status and the chatmail domain in use.
 
-The service listens on the port defined by `CHAT_SERVICE_PORT` (default `4041`).
-A health check is available at `GET /health`.
-
-> Note: there are no lint or automated test scripts configured.
+There are no test or lint scripts in this project.
 
 ## Configuration
 
-Configuration is read from a `.env` file. Copy `.env.example` to `.env` and adjust
-as needed.
+All settings are read from a `.env` file in the project root.
 
-| Variable               | Default              | Description                                                        |
-|------------------------|----------------------|--------------------------------------------------------------------|
-| `CHAT_SERVICE_PORT`    | `4041`               | Port the service listens on.                                       |
-| `DC_ACCOUNTS_PATH`     | `./dc-data`          | Directory for Delta Chat SQLite databases and `store.json`.        |
-| `CHATMAIL_DOMAIN`      | `nine.testrun.org`   | Chatmail server domain (production: `chat.serey.io`).              |
-| `RATE_LIMIT_MAX`       | `5`                  | Messages allowed per window, per user, per chat.                   |
-| `RATE_LIMIT_WINDOW_MS` | `10000`              | Rate-limit window in milliseconds.                                 |
-| `MAX_MSG_LENGTH`       | `2000`               | Maximum message length in characters.                              |
-| `INTERNAL_TOKEN`       | (required)           | Bearer token expected in the `X-Internal-Token` header on internal endpoints. |
-| `BOT_ADDR`             | (optional)           | Pin the bot to a fixed address across restarts.                    |
-| `BOT_PASSWORD`         | (optional)           | Password paired with `BOT_ADDR`.                                   |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CHAT_SERVICE_PORT` | `4040` | Port the HTTP server listens on. |
+| `DC_ACCOUNTS_PATH` | `./dc-data` | Folder for the Delta Chat databases and `store.json`. |
+| `CHATMAIL_DOMAIN` | `nine.testrun.org` | Chatmail server used for all accounts. Point this at your own server in production. |
+| `RATE_LIMIT_MAX` | `5` | Messages a user may send per chat within one window. |
+| `RATE_LIMIT_WINDOW_MS` | `10000` | Length of the rate limit window in milliseconds. |
+| `MAX_MSG_LENGTH` | `2000` | Maximum message length in characters. |
+| `INTERNAL_TOKEN` | required | Bearer token expected in the `X-Internal-Token` header on internal endpoints. |
+| `BOT_ADDR` | optional | Pin the bot account to a fixed address across restarts. |
+| `BOT_PASSWORD` | optional | Password that goes with `BOT_ADDR`. |
 
-The `DC_ACCOUNTS_PATH` directory contains all message history and should be backed
-up regularly.
+The `DC_ACCOUNTS_PATH` folder holds every account and the full message history. Back it up regularly.
 
-## API Reference
+## API
 
-All endpoints return JSON unless otherwise noted. Internal-only endpoints require
-the `X-Internal-Token` header.
+All endpoints accept and return JSON. Endpoints marked internal require the `X-Internal-Token` header.
 
-### System
+### System and accounts
 
-| Method | Path       | Description                  |
-|--------|------------|------------------------------|
-| `GET`  | `/health`  | Service health and domain.   |
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Service health and chatmail domain. |
+| `POST` | `/accounts` | Create a messaging account for a user. |
+| `GET` | `/accounts/:username` | Account details. |
+| `GET` | `/accounts/:username/qr` | Invite QR code for the account. |
+| `GET` | `/accounts/:username/key` | Account key material (internal). |
 
-### Accounts
+### Order chats
 
-| Method | Path                          | Description                                  |
-|--------|-------------------------------|----------------------------------------------|
-| `POST` | `/accounts`                   | Provision a Serey participant account.       |
-| `GET`  | `/accounts/:username`         | Fetch account details.                       |
-| `GET`  | `/accounts/:username/qr`      | Account invite QR code.                       |
-| `GET`  | `/accounts/:username/key`     | Account key material (internal).             |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/chats` | Create or look up an order chat. |
+| `POST` | `/send` | Send a message to an order chat. |
+| `POST` | `/send-system` | Send a system message. |
+| `GET` | `/messages` | Fetch messages for an order chat. |
+| `PATCH` | `/messages/:order_id/:message_id` | Edit a message. |
+| `DELETE` | `/messages/:order_id/:message_id` | Delete a message. |
+| `POST` | `/order-seen` | Mark an order chat as seen. |
+| `GET` | `/events` | Live event stream for an order chat. |
+| `GET` | `/events/user/:username` | Combined live event stream for everything a user is part of. |
 
-### Messaging
+### Shop chats
 
-| Method | Path                                | Description                              |
-|--------|-------------------------------------|------------------------------------------|
-| `POST` | `/chats`                            | Create or resolve an order chat.         |
-| `POST` | `/send`                             | Send a message to an order chat.         |
-| `POST` | `/send-system`                      | Send a system message.                   |
-| `GET`  | `/messages`                         | Fetch order-chat messages.               |
-| `POST` | `/order-seen`                       | Mark an order chat as seen.              |
-| `DELETE` | `/messages/:order_id/:message_id` | Delete an order-chat message.            |
-| `PATCH`  | `/messages/:order_id/:message_id` | Edit an order-chat message.              |
-| `GET`  | `/events`                           | SSE stream for an order chat.            |
-| `GET`  | `/events/user/:username`            | Aggregated SSE stream for a user.        |
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/shop-chats/:shop_id` | Chats belonging to a shop. |
+| `GET` | `/shop-chats/buyer/:username` | Shop chats a buyer has opened. |
+| `DELETE` | `/shop-chats/:order_id` | Delete a shop chat. |
+| `GET` | `/shop-events/:shop_id` | Live event stream for a shop. |
 
 ### Groups
 
-| Method   | Path                                              | Description                          |
-|----------|---------------------------------------------------|--------------------------------------|
-| `POST`   | `/groups`                                         | Create a Serey community group.      |
-| `GET`    | `/groups`                                         | List groups.                         |
-| `GET`    | `/groups/:community_id`                           | Group details.                       |
-| `PATCH`  | `/groups/:community_id`                           | Update group metadata.               |
-| `PATCH`  | `/groups/:community_id/enabled`                   | Enable or disable a group.           |
-| `PUT`    | `/groups/:community_id/settings`                  | Update group settings (admin).       |
-| `POST`   | `/groups/:community_id/send`                      | Send a group message.                |
-| `GET`    | `/groups/:community_id/messages`                  | Fetch group messages.                |
-| `DELETE` | `/groups/:community_id/messages/:msg_id`          | Delete a group message.              |
-| `PATCH`  | `/groups/:community_id/messages/:msg_id`          | Edit a group message.                |
-| `DELETE` | `/groups/:community_id/messages`                  | Clear all group messages (owner).    |
-| `GET`    | `/groups/:community_id/events`                    | SSE stream for a group.              |
-| `POST`   | `/groups/:community_id/join`                      | Join a group.                        |
-| `POST`   | `/groups/:community_id/rejoin`                    | Rejoin a group.                      |
-| `POST`   | `/groups/:community_id/leave`                     | Leave a group.                       |
-| `POST`   | `/groups/:community_id/seen`                      | Mark a group as seen.                |
-| `POST`   | `/groups/:community_id/transfer-ownership`        | Transfer ownership.                  |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/groups` | Create a community group. |
+| `GET` | `/groups` | List groups. |
+| `GET` | `/groups/:community_id` | Group details. |
+| `PATCH` | `/groups/:community_id` | Update group details. |
+| `PATCH` | `/groups/:community_id/enabled` | Enable or disable a group. |
+| `PUT` | `/groups/:community_id/settings` | Update group settings. |
+| `POST` | `/groups/:community_id/send` | Send a message. |
+| `GET` | `/groups/:community_id/messages` | Fetch messages. |
+| `PATCH` | `/groups/:community_id/messages/:msg_id` | Edit a message. |
+| `DELETE` | `/groups/:community_id/messages/:msg_id` | Delete a message. |
+| `DELETE` | `/groups/:community_id/messages` | Clear every message in the group. |
+| `GET` | `/groups/:community_id/events` | Live event stream for the group. |
+| `POST` | `/groups/:community_id/join` | Join a group. |
+| `POST` | `/groups/:community_id/rejoin` | Rejoin a group after leaving. |
+| `POST` | `/groups/:community_id/leave` | Leave a group. |
+| `POST` | `/groups/:community_id/seen` | Mark a group as seen. |
+| `POST` | `/groups/:community_id/transfer-ownership` | Hand ownership to another member. |
 
-### Group membership and moderation
+### Members and moderation
 
-| Method   | Path                                                       | Min. role  |
-|----------|------------------------------------------------------------|------------|
-| `GET`    | `/groups/:community_id/members`                            | member     |
-| `POST`   | `/groups/:community_id/members`                            | admin      |
-| `DELETE` | `/groups/:community_id/members/:username`                  | moderator  |
-| `POST`   | `/groups/:community_id/members/:username/mute`             | moderator  |
-| `DELETE` | `/groups/:community_id/members/:username/mute`             | moderator  |
-| `POST`   | `/groups/:community_id/members/:username/ban`              | moderator  |
-| `DELETE` | `/groups/:community_id/members/:username/ban`              | moderator  |
-| `POST`   | `/groups/:community_id/members/:username/role`             | admin      |
-| `GET`    | `/groups/:community_id/join-requests`                      | admin      |
-| `POST`   | `/groups/:community_id/join-requests/:username/approve`    | admin      |
-| `DELETE` | `/groups/:community_id/join-requests/:username`            | admin      |
+| Method | Path | Minimum role |
+|--------|------|--------------|
+| `GET` | `/groups/:community_id/members` | member |
+| `POST` | `/groups/:community_id/members` | admin |
+| `DELETE` | `/groups/:community_id/members/:username` | moderator |
+| `POST` | `/groups/:community_id/members/:username/mute` | moderator |
+| `DELETE` | `/groups/:community_id/members/:username/mute` | moderator |
+| `POST` | `/groups/:community_id/members/:username/ban` | moderator |
+| `DELETE` | `/groups/:community_id/members/:username/ban` | moderator |
+| `POST` | `/groups/:community_id/members/:username/role` | admin |
+| `GET` | `/groups/:community_id/join-requests` | admin |
+| `POST` | `/groups/:community_id/join-requests/:username/approve` | admin |
+| `DELETE` | `/groups/:community_id/join-requests/:username` | admin |
 
 ### Invite links
 
-| Method   | Path                                              | Description                  |
-|----------|---------------------------------------------------|------------------------------|
-| `POST`   | `/groups/:community_id/invite-links`              | Create an invite link.       |
-| `GET`    | `/groups/:community_id/invite-links`              | List invite links.           |
-| `DELETE` | `/groups/:community_id/invite-links/:token`       | Revoke an invite link.       |
-| `POST`   | `/groups/:community_id/invite/send`               | Send an invite to a user.    |
-| `GET`    | `/invite/:token`                                  | Resolve an invite token.     |
-| `POST`   | `/invite/:token/join`                             | Join via an invite token.    |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/groups/:community_id/invite-links` | Create an invite link. |
+| `GET` | `/groups/:community_id/invite-links` | List invite links. |
+| `DELETE` | `/groups/:community_id/invite-links/:token` | Revoke an invite link. |
+| `POST` | `/groups/:community_id/invite/send` | Send an invite to a user. |
+| `GET` | `/invite/:token` | Look up an invite token. |
+| `POST` | `/invite/:token/join` | Join a group using an invite token. |
 
 ### User groups
 
-| Method   | Path                          | Description                       |
-|----------|-------------------------------|-----------------------------------|
-| `POST`   | `/user-groups`                | Create a user group (`ug_`).      |
-| `GET`    | `/user-groups/:username`      | List a user's groups.             |
-| `PATCH`  | `/user-groups/:group_id`      | Update a user group.              |
-| `DELETE` | `/user-groups/:group_id`      | Delete a user group.              |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/user-groups` | Create a user group. IDs start with `ug_`. |
+| `GET` | `/user-groups/:username` | Groups a user belongs to. |
+| `PATCH` | `/user-groups/:group_id` | Update a user group. |
+| `DELETE` | `/user-groups/:group_id` | Delete a user group. |
 
 ### Direct messages
 
-| Method   | Path                                     | Description                          |
-|----------|------------------------------------------|--------------------------------------|
-| `POST`   | `/dm`                                     | Open or resolve a 1:1 DM.            |
-| `POST`   | `/dm/external`                            | Open a DM with an external contact.  |
-| `GET`    | `/dm/user/:username`                      | List a user's DMs.                   |
-| `POST`   | `/dm/:dm_key/send`                        | Send a DM.                           |
-| `GET`    | `/dm/:dm_key/messages`                    | Fetch DM messages.                   |
-| `GET`    | `/dm/:dm_key/events`                      | SSE stream for a DM.                 |
-| `POST`   | `/dm/:dm_key/seen`                        | Mark a DM as seen.                   |
-| `POST`   | `/dm/:dm_key/mute`                        | Mute a DM.                           |
-| `DELETE` | `/dm/:dm_key/mute`                        | Unmute a DM.                         |
-| `DELETE` | `/dm/:dm_key/messages/:message_id`        | Delete a DM message.                 |
-| `PATCH`  | `/dm/:dm_key/messages/:message_id`        | Edit a DM message.                   |
-| `DELETE` | `/dm/:dm_key`                             | Delete a DM.                         |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/dm` | Open or look up a conversation between two users. |
+| `POST` | `/dm/external` | Open a conversation with an outside contact. |
+| `GET` | `/dm/user/:username` | Conversations a user is part of. |
+| `POST` | `/dm/:dm_key/send` | Send a message. |
+| `GET` | `/dm/:dm_key/messages` | Fetch messages. |
+| `PATCH` | `/dm/:dm_key/messages/:message_id` | Edit a message. |
+| `DELETE` | `/dm/:dm_key/messages/:message_id` | Delete a message. |
+| `GET` | `/dm/:dm_key/events` | Live event stream for the conversation. |
+| `POST` | `/dm/:dm_key/seen` | Mark the conversation as seen. |
+| `POST` | `/dm/:dm_key/mute` | Mute the conversation. |
+| `DELETE` | `/dm/:dm_key/mute` | Unmute the conversation. |
+| `DELETE` | `/dm/:dm_key` | Delete the conversation. |
 
-### Shops and moderation
+### Blocking
 
-| Method   | Path                              | Description                       |
-|----------|-----------------------------------|-----------------------------------|
-| `GET`    | `/shop-events/:shop_id`           | SSE stream for shop events.       |
-| `GET`    | `/shop-chats/:shop_id`            | List shop chats.                  |
-| `GET`    | `/shop-chats/buyer/:username`     | List a buyer's shop chats.        |
-| `DELETE` | `/shop-chats/:order_id`           | Delete a shop chat.               |
-| `POST`   | `/moderation/block`               | Block a user.                     |
-| `DELETE` | `/moderation/block`               | Unblock a user.                   |
-| `GET`    | `/moderation/blocks/:username`    | List a user's blocks.             |
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/moderation/block` | Block a user. |
+| `DELETE` | `/moderation/block` | Unblock a user. |
+| `GET` | `/moderation/blocks/:username` | Users someone has blocked. |
 
-## Moderation Model
+## Roles
 
-Group roles are ranked as follows:
+Group members hold one of four roles, ranked from highest to lowest.
 
-```
-owner (4) > admin (3) > moderator (2) > member (1)
-```
+| Role | What it allows |
+|------|----------------|
+| owner | Transfer ownership, enable or disable the group, clear all messages, promote admins. Everything below as well. |
+| admin | Approve join requests, invite members, assign roles, mute and ban anyone except the owner. |
+| moderator | Delete messages, kick, mute and ban regular members. |
+| member | Send messages and delete their own. |
 
-| Role      | Capabilities                                                                    |
-|-----------|---------------------------------------------------------------------------------|
-| owner     | Transfer ownership, enable / disable group, clear all messages, promote admins. |
-| admin     | Approve joins, invite members, set roles, mute / ban (not the owner).           |
-| moderator | Delete messages, kick, mute, ban (not owner / admin).                           |
-| member    | Send messages, delete own messages.                                             |
-
-Additional safeguards run as middleware on each request: block-list checks,
-sliding-window rate limiting, repeated-message spam filtering, group membership /
-ban / mute / announcement-mode guards, and minimum-role enforcement.
+Each request also passes through the block list, the rate limiter, the spam filter and the group guard, which checks membership, bans, mutes and announcement mode before a message is accepted.
 
 ## Deployment
 
-A Docker image based on Alpine Node 20 is provided. The `/data` directory is the
-persistent volume for Delta Chat accounts and `store.json`; mount it to durable
-storage and include it in backups.
+A Dockerfile is included, based on the Alpine Node 20 image. The container stores accounts and `store.json` under `/data`, so mount that path to persistent storage and include it in your backups. The image exposes port `4040` and ships with a health check against `/health`.
 
-## Utility Scripts
+## Utility scripts
 
-| Script             | Purpose                                                                            |
-|--------------------|------------------------------------------------------------------------------------|
-| `migrate-dms.js`   | One-time migration from the legacy bot-DM format to the per-user DM format.         |
-| `check-config.js`  | Inspect the current configuration.                                                  |
+| Script | Purpose |
+|--------|---------|
+| `migrate-dms.js` | One time migration from the old bot based direct message format to the per user format. Run it before deploying the per user update. |
+| `check-config.js` | Print the configuration the service will start with. |
 
-Run a script with `node <script>.js`. Run `migrate-dms.js` before deploying the
-per-user DM update.
+Run any of them with `node <script>.js`.
 
-## Project Structure
+## Project layout
 
-| File                          | Role                                                                    |
-|-------------------------------|-------------------------------------------------------------------------|
-| `index.js`                    | Express routes, SSE registry, IO lifecycle, event listener, formatting. |
-| `dc-client.js`                | EventEmitter wrapper around the Delta Chat RPC subprocess.              |
-| `store.js`                    | File-backed JSON store with debounced atomic writes.                    |
-| `middleware/blockCheck.js`    | Block-list enforcement.                                                 |
-| `middleware/rateLimiter.js`   | Per-user, per-chat sliding-window rate limit.                           |
-| `middleware/spamFilter.js`    | Repeated-message spam detection.                                        |
-| `middleware/groupGuard.js`    | Membership, ban, mute, and announcement-mode checks.                    |
-| `middleware/requireRole.js`   | Minimum-role rank enforcement.                                          |
-| `middleware/internalAuth.js`  | Bearer-token guard for internal endpoints.                             |
+| File | Role |
+|------|------|
+| `index.js` | Express routes, the SSE registry, startup and shutdown, and the Delta Chat event listener. |
+| `dc-client.js` | Thin wrapper around the Delta Chat RPC subprocess. |
+| `store.js` | JSON store on disk with debounced atomic writes. |
+| `middleware/blockCheck.js` | Rejects requests between users who have blocked each other. |
+| `middleware/rateLimiter.js` | Sliding window rate limit per user and per chat. |
+| `middleware/spamFilter.js` | Repeated message detection and length limit. |
+| `middleware/groupGuard.js` | Membership, ban, mute and announcement mode checks for group routes. |
+| `middleware/requireRole.js` | Minimum role check for moderation actions. |
+| `middleware/internalAuth.js` | Bearer token guard for internal endpoints. |
 
 ## License
 
-Proprietary. Part of the Serey platform.
+Proprietary.
