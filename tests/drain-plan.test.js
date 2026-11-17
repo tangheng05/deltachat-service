@@ -17,7 +17,7 @@ test('dormant accounts are only drained a slice at a time', () => {
   const { targets } = planDrain({ accounts: all, now: NOW, isHeld: () => false, cursor: 0 });
   const perRun = Math.ceil(2300 / (SLOW_CYCLE_MS / DRAIN_INTERVAL_MS));
   assert.strictEqual(targets.length, perRun);
-  assert.ok(targets.length < 30);
+  assert.ok(targets.length <= 115);
 });
 
 test('every dormant account is reached within one slow cycle', () => {

@@ -3173,6 +3173,7 @@ async function start() {
       cursor: drainCursor,
     });
     drainCursor = plan.cursor;
+    console.log(`[user-drain] waking ${plan.targets.length} of ${plan.active + plan.dormant} accounts (${plan.active} recently active)`);
     // Spread the wake-ups over the first half of the interval instead of one burst.
     const gap = Math.min(2000, DRAIN_INTERVAL_MS / 2 / Math.max(plan.targets.length, 1));
     plan.targets.forEach((accountId, i) => {
