@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 import { DeltaChatClient } from './dc-client.js';
 import { Store } from './store.js';
+import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
 import { blockCheck } from './middleware/blockCheck.js';
@@ -3091,6 +3092,7 @@ app.get('/events/user/:username', (req, res) => {
   // Track which accountId we acquired IO for so we release the right one on close.
   let acquiredAccountId = null;
 
+  store.touchAccount(username);
   const info = store.getAccount(username);
   if (info?.accountId) {
     acquiredAccountId = info.accountId;
@@ -3120,6 +3122,7 @@ app.get('/dm/user/:username', (req, res) => {
   // The messages page calls this every 30s. Use it as a presence heartbeat:
   // keep the user's account IO alive so IncomingMsg fires while they're online.
   // IO stops 45s after they leave (linger > polling interval = no gap).
+  store.touchAccount(username);
   const info = store.getAccount(username);
   if (info?.accountId) {
     dc.rpc.startIo(info.accountId).catch(() => {});
@@ -3153,24 +3156,36 @@ async function start() {
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
   setInterval(startAllUserIo, 30_000).unref(); // bot keepalive only
 
-  // Briefly start IO for every provisioned user account so DC downloads any
-  // pending IMAP mail and fires IncomingMsg. Runs every 3 minutes.
+  // Briefly start IO for user accounts so DC downloads any pending IMAP mail
+  // and fires IncomingMsg. Runs every 3 minutes: recently used accounts each
+  // run, the rest in a slow rotation (see drain-plan.js).
   // IMPORTANT: interval MUST be > IO_LINGER_MS (45s) so chatmail has an
   // off-window to push to DC mobile apps. Keeping IO on permanently prevents
   // chatmail from sending push notifications to mobile clients.
   // For active web users, IO is held by ioAcquire via SSE — this drain only
   // serves as a fallback for accounts with no active SSE connection.
+  let drainCursor = 0;
   function drainUserAccounts() {
-    for (const [username, info] of Object.entries(store.getAllAccounts())) {
-      if (username === '__bot__' || !info?.accountId) continue;
-      if ((ioRefs.get(info.accountId) || 0) > 0) continue; // SSE already holds IO open
-      dc.rpc.startIo(info.accountId)
-        .then(() => ioSendLinger(info.accountId))
-        .catch((e) => console.warn(`[user-drain] startIo failed for ${username}:`, e.message));
-    }
+    const plan = planDrain({
+      accounts: store.getAllAccounts(),
+      now: Date.now(),
+      isHeld: (id) => (ioRefs.get(id) || 0) > 0, // SSE already holds IO open
+      cursor: drainCursor,
+    });
+    drainCursor = plan.cursor;
+    // Spread the wake-ups over the first half of the interval instead of one burst.
+    const gap = Math.min(2000, DRAIN_INTERVAL_MS / 2 / Math.max(plan.targets.length, 1));
+    plan.targets.forEach((accountId, i) => {
+      setTimeout(() => {
+        if ((ioRefs.get(accountId) || 0) > 0) return;
+        dc.rpc.startIo(accountId)
+          .then(() => ioSendLinger(accountId))
+          .catch((e) => console.warn(`[user-drain] startIo failed for account ${accountId}:`, e.message));
+      }, i * gap).unref();
+    });
   }
   drainUserAccounts();
-  setInterval(drainUserAccounts, 3 * 60_000).unref();
+  setInterval(drainUserAccounts, DRAIN_INTERVAL_MS).unref();
 
   app.listen(PORT, () => {
     console.log(`\n[chat-service] listening on port ${PORT}`);

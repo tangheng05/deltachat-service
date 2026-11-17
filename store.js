@@ -95,6 +95,14 @@ export class Store {
   getAccount(username) { return this.data.accounts[username] ?? null; }
   getAllAccounts() { return this.data.accounts; }
 
+  // Presence stamp for the drain plan. Hourly, so polls don't rewrite the store.
+  touchAccount(username, at = Date.now()) {
+    const info = this.data.accounts[username];
+    if (!info || at - (info.lastActiveAt || 0) < 3600_000) return;
+    info.lastActiveAt = at;
+    this._save();
+  }
+
   setAccount(username, info) {
     // A DC accountId must map to exactly one username. If another username
     // already claims this accountId, that mapping is stale (DC reused the id
