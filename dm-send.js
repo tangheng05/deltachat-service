@@ -51,3 +51,7 @@ export function unlinkMismatchedQuotes(messages) {
     return { ...m, replyTo: { id: null, text: m.replyTo.text, senderUsername: null } };
   });
 }
+
+// A failed message never reached the other user, so only its sender sees it.
+export const hideUndelivered = (messages, viewerUsername) =>
+  messages.filter((m) => !m.failed || m.senderUsername === viewerUsername);

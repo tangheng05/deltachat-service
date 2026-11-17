@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { DeltaChatClient } from './dc-client.js';
 import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
-import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes } from './dm-send.js';
+import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
 import { blockCheck } from './middleware/blockCheck.js';
@@ -2760,9 +2760,11 @@ async function loadDmPage(accountId, chatIds, dmKey, dm, viewerUser, opts) {
   const { page, hasMore, nextBefore } = pageIds(idSets.flat(), opts);
   const messages = unlinkMismatchedQuotes((await loadMessagesById(accountId, page))
     .map((msg) => formatDmMessage(msg, dm, viewerUser)));
+  // Failures from before MsgFailed was tracked are only known from DC's state.
+  messages.filter((m) => m.failed).forEach((m) => store.markDmMessageFailed(dmKey, m.id));
   if (opts.before) return { messages: chronological(messages), hasMore, nextBefore };
 
-  const merged = mergeDmMessages(messages, store.getDmCachedMessages(dmKey));
+  const merged = hideUndelivered(mergeDmMessages(messages, store.getDmCachedMessages(dmKey)), viewerUser);
   if (!dm.lastMessage) {
     const last = [...merged].reverse().find((m) => m.text && !m.isSystem);
     if (last) store.setDmLastMessage(dmKey, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });

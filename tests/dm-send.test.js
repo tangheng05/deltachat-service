@@ -77,3 +77,14 @@ test('a quote linked to a message with different text is shown as text only', as
   assert.strictEqual(out[3].replyTo.id, 27);
   assert.strictEqual(out[5].replyTo.id, 5);
 });
+
+test('a failed message is only shown to its sender', async () => {
+  const { hideUndelivered } = await import('../dm-send.js');
+  const msgs = [
+    { id: 1, text: 'ok', senderUsername: 'jelly' },
+    { id: 2, text: 'lost', senderUsername: 'jelly', failed: true },
+    { id: 3, text: 'mine lost', senderUsername: 'heng', failed: true },
+  ];
+  assert.deepStrictEqual(hideUndelivered(msgs, 'heng').map((m) => m.id), [1, 3]);
+  assert.deepStrictEqual(hideUndelivered(msgs, 'jelly').map((m) => m.id), [1, 2]);
+});
