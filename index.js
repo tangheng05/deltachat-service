@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { DeltaChatClient } from './dc-client.js';
 import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
+import { DeviceLogins } from './device-login.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -1354,6 +1355,44 @@ app.get('/accounts/:username/qr', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── Phone login: "Add as Second Device" code ─────────────────────────
+// The code hands the phone this account's keys and history, so it is only ever
+// returned to the account's own user (the website checks the session).
+// dc.rpc only exists after dc.start(), so each call looks it up when used.
+const deviceLogins = new DeviceLogins({
+  provideBackup: (id) => dc.rpc.provideBackup(id),
+  getBackupQr: (id) => dc.rpc.getBackupQr(id),
+  stopOngoingProcess: (id) => dc.rpc.stopOngoingProcess(id),
+  startIo: (id) => dc.rpc.startIo(id),
+});
+dc.on('ImexProgress', (contextId, e) => deviceLogins.onProgress(contextId, e.progress));
+
+app.post('/accounts/:username/device-login', async (req, res) => {
+  const info = store.getAccount(req.params.username);
+  if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
+  try {
+    const { qr, expiresAt } = await withTimeout(deviceLogins.start(info.accountId), 60_000, 'device-login');
+    console.log(`[device-login] code issued for account ${info.accountId}`);
+    res.json({ qr, expiresAt });
+  } catch (e) {
+    console.error('[device-login]', e.message);
+    res.status(500).json({ error: 'Could not create the login code. Try again.' });
+  }
+});
+
+app.get('/accounts/:username/device-login', (req, res) => {
+  const info = store.getAccount(req.params.username);
+  if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
+  res.json(deviceLogins.status(info.accountId));
+});
+
+app.delete('/accounts/:username/device-login', async (req, res) => {
+  const info = store.getAccount(req.params.username);
+  if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
+  await deviceLogins.cancel(info.accountId);
+  res.json({ ok: true });
 });
 
 // ── GET /accounts/:username/key ───────────────────────────────────────
