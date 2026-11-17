@@ -11,6 +11,7 @@ import { DeltaChatClient } from './dc-client.js';
 import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
+import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -104,6 +105,36 @@ async function readBotChatIds(botId, chatId, ms, tag, id) {
     console.warn(`${tag} getMessageIds failed for ${id} (chat ${chatId}): ${e.message}`);
     throw Object.assign(new Error('Chat service busy, retry'), { status: 503 });
   }
+}
+
+// Order and shop chats are stored only in the bot's DC database, so this write
+// is the message. A rejected write saved nothing, so one retry is safe; there is
+// no timeout here because a slow write that is retried would save the message twice.
+async function writeBotMessage(botId, chatId, text, replyToId = null) {
+  try {
+    return await dc.sendTextMsg(botId, chatId, text, replyToId);
+  } catch (e) {
+    console.warn(`[bot write] retrying chat ${chatId}: ${e.message}`);
+    await new Promise((r) => setTimeout(r, 1500));
+    return dc.sendTextMsg(botId, chatId, text, replyToId);
+  }
+}
+
+// Chats from before previews were recorded: read each one's last message once.
+async function backfillOrderPreviews() {
+  const botId = await ensureBotAccount();
+  let filled = 0;
+  for (const [orderId, chat] of Object.entries(store.data.orderChats)) {
+    if (chat.lastMessage || !chat.chatId) continue;
+    try {
+      const ids = (await withTimeout(dc.getMessageIds(botId, chat.chatId), 8_000, 'getMessageIds')).slice(-30);
+      const last = lastRealMessage((await loadMessagesById(botId, ids)).filter(isRealMessage).map(formatMessage));
+      if (last) { store.setOrderChatLastMessage(orderId, last); filled++; }
+    } catch (e) {
+      console.warn(`[order previews] ${orderId}: ${e.message}`);
+    }
+  }
+  console.log(`[order previews] filled ${filled} chat(s)`);
 }
 
 const chronological = (messages) =>
@@ -1482,12 +1513,21 @@ app.post('/send', (req, res, next) => {
     res.json({ msgId: localId });
 
     const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
-    dc.sendTextMsg(botId, chat.chatId, `${role} (${sender_username}): ${text}`, replyToId)
+    const toInbox = (event) => {
+      sseBroadcast(`order:${order_id}`, event);
+      if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { ...event, order_id });
+    };
+    writeBotMessage(botId, chat.chatId, `${role} (${sender_username}): ${text}`, replyToId)
       .then((realMsgId) => {
-        sseBroadcast(`order:${order_id}`, { type: 'message_id_updated', localId, realId: realMsgId });
-        if (shopMatch) sseBroadcast(`shopinbox:${shopMatch[1]}`, { type: 'message_id_updated', localId, realId: realMsgId, order_id });
+        store.setOrderChatLastMessage(order_id, { text, senderUsername: sender_username, timestamp: payload.timestamp });
+        toInbox({ type: 'message_id_updated', localId, realId: realMsgId });
       })
-      .catch(e => console.error('[/send] DC error:', e.message));
+      .catch((e) => {
+        // The message exists only on the sender's screen: say so instead of losing it silently.
+        console.error(`[/send] could not save message for ${order_id}:`, e.message);
+        // Open-chat channel only: the inbox stream of older website builds treats unknown events as messages.
+        sseBroadcast(`order:${order_id}`, { type: 'message_send_failed', localId });
+      });
   } catch (e) {
     console.error('[/send]', e.message);
     if (!res.headersSent) res.status(500).json({ error: e.message });
@@ -1514,7 +1554,8 @@ app.post('/send-system', async (req, res) => {
       '━━━━━━━━━━━━━━━━━━━━━━━',
     ].filter(Boolean);
 
-    const msgId = await dc.sendTextMsg(botId, chat.chatId, lines.join('\n'));
+    const msgId = await writeBotMessage(botId, chat.chatId, lines.join('\n'));
+    store.setOrderChatLastMessage(order_id, { text: `📦 ${statusLine}`, senderUsername: null, timestamp: Math.floor(Date.now() / 1000) });
     res.json({ msgId });
   } catch (e) {
     console.error('[/send-system]', e.message);
@@ -1534,7 +1575,8 @@ app.get('/messages', async (req, res) => {
     const botId = await ensureBotAccount();
     const msgIds = await readBotChatIds(botId, chat.chatId, 5_000, '[orders]', `order ${order_id}`);
     const { page, hasMore, nextBefore } = pageIds(msgIds, pageOpts(req.query));
-    const messages = chronological((await loadMessagesById(botId, page)).map(formatMessage));
+    const messages = chronological((await loadMessagesById(botId, page)).filter(isRealMessage).map(formatMessage));
+    if (!chat.lastMessage && !req.query.before) store.setOrderChatLastMessage(order_id, lastRealMessage(messages));
 
     res.json({ messages, lastSeenBy: chat.lastSeenBy || {}, hasMore, nextBefore });
   } catch (e) {
@@ -2499,8 +2541,7 @@ app.get('/shop-chats/buyer/:username', (req, res) => {
 // ── GET /shop-chats/:shop_id ───────────────────────────────────────────
 app.get('/shop-chats/:shop_id', (req, res) => {
   const { shop_id } = req.params;
-  const chats = store.getShopChats(shop_id);
-  res.json({ chats });
+  res.json({ chats: sellerInbox(store.getShopChats(shop_id)) });
 });
 
 // ── POST /moderation/block ────────────────────────────────────────────
@@ -3322,6 +3363,7 @@ async function start() {
   setInterval(drainUserAccounts, DRAIN_INTERVAL_MS).unref();
 
   app.listen(PORT, () => {
+    backfillOrderPreviews().catch((e) => console.warn('[order previews]', e.message));
     console.log(`\n[chat-service] listening on port ${PORT}`);
     console.log(`[chat-service] chatmail domain : ${CHATMAIL_DOMAIN}`);
     console.log(`[chat-service] dc accounts path: ${DC_ACCOUNTS_PATH}\n`);

@@ -142,6 +142,19 @@ export class Store {
     this._save();
   }
 
+  // Preview, sort key and unread baseline for the shop inbox.
+  setOrderChatLastMessage(orderId, msg) {
+    const chat = this.data.orderChats[String(orderId)];
+    if (!chat || !msg?.text || (msg.timestamp || 0) < (chat.lastMessageAt || 0)) return;
+    chat.lastMessage = { text: msg.text.substring(0, 200), senderUsername: msg.senderUsername ?? null, timestamp: msg.timestamp };
+    chat.lastMessageAt = msg.timestamp;
+    if (msg.senderUsername) {
+      chat.lastSeenBy ??= {};
+      chat.lastSeenBy[msg.senderUsername] = Math.max(chat.lastSeenBy[msg.senderUsername] || 0, msg.timestamp);
+    }
+    this._save();
+  }
+
   findOrderIdByChatId(chatId) {
     for (const [id, info] of Object.entries(this.data.orderChats)) {
       if (info.chatId === chatId) return id;
