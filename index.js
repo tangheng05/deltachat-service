@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { DeltaChatClient } from './dc-client.js';
 import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
+import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
 import { blockCheck } from './middleware/blockCheck.js';
@@ -369,36 +370,20 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
       );
       // Securejoin requires 2 chatmail round-trips (A→B→A via SMTP+IMAP).
       // chatmail IMAP polling can add up to ~60s per hop → full exchange up to ~120s.
+      const finished = waitForHandshake(dmKey, 120_000);
       const chatIdInA = await withTimeout(
         dc.rpc.secureJoin(accountIdA, qr), 120_000, 'bootstrap/secureJoin'
       );
-      _bootstrapFailedAt.delete(dmKey); // clear failure record on success
       const dm = store.getDm(dmKey);
-      if (dm) {
-        const isA = dm.userAAccountId === accountIdA;
-        let update = { ...dm, securejoinDone: true };
-        // Set A's chatId (returned by secureJoin).
-        // secureJoin may return 0 when DC considers the contact already verified
-        // but the chat was created under a different chatId — fall back to canonical
-        // resolution so the sender always gets the correct post-securejoin chatId.
-        if (chatIdInA) {
-          update = addDmChatId(update, isA ? 'A' : 'B', chatIdInA);
-        } else {
-          const addrB = store.getAccount(isA ? dm.userB : dm.userA)?.addr;
-          if (addrB) {
-            const resolved = await resolveCanonicalChatId(accountIdA, addrB, dmKey, isA).catch(() => 0);
-            if (resolved) update = addDmChatId(update, isA ? 'A' : 'B', resolved);
-          }
-        }
-        // Also resolve B's chatId so B can read messages without waiting for IncomingMsg
-        const addrA = store.getAccount(isA ? dm.userA : dm.userB)?.addr;
-        if (addrA) {
-          const chatIdInB = await resolveCanonicalChatId(accountIdB, addrA, dmKey, !isA).catch(() => 0);
-          if (chatIdInB) update = addDmChatId(update, isA ? 'B' : 'A', chatIdInB);
-        }
-        store.setDm(dmKey, update);
-        console.log(`[dm bootstrap] securejoin done for ${dmKey}`);
+      if (dm && chatIdInA) {
+        store.setDm(dmKey, addDmChatId(dm, dm.userAAccountId === accountIdA ? 'A' : 'B', chatIdInA));
       }
+      // secureJoin() returns as soon as the handshake STARTS. Both accounts stay
+      // awake until DC reports it finished; onSecurejoinDone stores the encrypted
+      // chat of each side and marks the DM done.
+      if (!(await finished)) throw new Error('handshake did not finish in time');
+      _bootstrapFailedAt.delete(dmKey); // clear failure record on success
+      console.log(`[dm bootstrap] securejoin done for ${dmKey}`);
       // Stop IO for any account not currently held open by an SSE client.
       // Keeping server IMAP alive blocks chatmail from pushing to mobile.
       // Web users (ioRefs > 0) are managed by ioAcquire/ioRelease — don't interfere.
@@ -416,6 +401,181 @@ function bootstrapDmKeys(dmKey, accountIdA, accountIdB) {
   _bootstrapInFlight.set(dmKey, promise);
   return promise;
 }
+
+// ── Handshake completion ─────────────────────────────────────────────
+// DC reports the end of a securejoin per account. That is the only point where
+// the encrypted chat of each side is known, so it is where the DM is marked done.
+const _handshakeWaiters = new Map(); // dmKey → [resolve]
+
+function waitForHandshake(dmKey, ms) {
+  return new Promise((resolve) => {
+    const done = (ok) => { clearTimeout(timer); resolve(ok); };
+    const timer = setTimeout(() => done(false), ms);
+    timer.unref?.();
+    _handshakeWaiters.set(dmKey, [...(_handshakeWaiters.get(dmKey) || []), done]);
+  });
+}
+
+async function onSecurejoinDone(contextId, contactId, role, chatIdHint) {
+  try {
+    const contact = await dc.getContact(contextId, contactId);
+    const other = store.findUsernameByAddr(contact.address);
+    const myAddr = await dc.getConfig(contextId, 'addr').catch(() => null);
+    const me = (myAddr && store.findUsernameByAddr(myAddr)) || store.findUsernameByAccountId(contextId);
+    if (!other || !me || other === me) return;
+    const dmKey = [me, other].sort().join(':');
+    const chatId = chatIdHint || await dc.createChatByContactId(contextId, contactId).catch(() => 0);
+    const dm = store.getDm(dmKey);
+    if (!dm || dm.dcExternal) return;
+    const update = { ...(chatId ? addDmChatId(dm, dm.userA === me ? 'A' : 'B', chatId) : dm) };
+    if (role === 'joiner') update.securejoinDone = true;
+    store.setDm(dmKey, update);
+    console.log(`[dm handshake] ${role} side finished for ${dmKey} (chat ${chatId})`);
+    if (role === 'joiner') {
+      (_handshakeWaiters.get(dmKey) || []).forEach((done) => done(true));
+      _handshakeWaiters.delete(dmKey);
+    }
+    flushUserSends(dmKey).catch(() => {});
+  } catch (e) {
+    console.warn('[dm handshake]', e.message);
+  }
+}
+
+dc.on('SecurejoinInviterProgress', (contextId, e) => {
+  if (e.progress === 1000) onSecurejoinDone(contextId, e.contactId, 'inviter', e.chatId);
+});
+dc.on('SecurejoinJoinerProgress', (contextId, e) => {
+  if (e.progress === 1000) onSecurejoinDone(contextId, e.contactId, 'joiner', 0);
+});
+
+// ── Per-user DM outbound queue ───────────────────────────────────────
+// chatmail refuses cleartext mail, so a message only goes out once this side
+// has an encrypted chat with the other user. Until then it waits in the DM
+// record (survives a restart) and is retried; after ~5 minutes it is marked failed.
+const USER_SEND_ATTEMPTS = Number(process.env.DM_SEND_ATTEMPTS) || 14;
+const _userFlushing = new Map();    // dmKey → bool
+const _userRetryTimers = new Map(); // dmKey → timeout
+
+const pendingUserSends = (dmKey) => store.getDm(dmKey)?.pendingSends || [];
+
+function setPendingUserSends(dmKey, list) {
+  const dm = store.getDm(dmKey);
+  if (!dm) return;
+  const { pendingSends, ...rest } = dm;
+  store.setDm(dmKey, list.length ? { ...rest, pendingSends: list } : rest);
+}
+
+function failDmMessage(dmKey, id) {
+  store.markDmMessageFailed(dmKey, id);
+  sseBroadcast(`dm:${dmKey}`, { type: 'message_send_failed', localId: id });
+}
+
+function queueUserSend(dmKey, item) {
+  setPendingUserSends(dmKey, [...pendingUserSends(dmKey), item]);
+}
+
+// 'sent' | 'wait' (keys not ready, keep queued) | 'failed'
+async function sendQueuedUserMessage(dmKey, item) {
+  const dm = store.getDm(dmKey);
+  if (!dm || dm.dcExternal) return 'failed';
+  const isA = dm.userA === item.sender;
+  const accountId = isA ? dm.userAAccountId : dm.userBAccountId;
+  if (!accountId) return 'failed';
+  const otherAddr = store.getAccount(isA ? dm.userB : dm.userA)?.addr;
+
+  await dc.rpc.startIo(accountId).catch(() => {});
+  ioSendLinger(accountId);
+
+  const known = [isA ? dm.userAChatId : dm.userBChatId, ...((isA ? dm.userAChatIds : dm.userBChatIds) || [])];
+  const contactId = otherAddr ? await dc.lookupContactIdByAddr(accountId, otherAddr).catch(() => 0) : 0;
+  const byAddr = contactId ? await dc.createChatByContactId(accountId, contactId).catch(() => 0) : 0;
+  const chatId = await pickEncryptedChat(
+    [...known, byAddr],
+    (cid) => dc.rpc.getBasicChatInfo(accountId, cid).then((c) => c.isEncrypted === true),
+  );
+  if (!chatId) {
+    // No encrypted chat yet, or an old "done" flag was wrong: (re)run the handshake.
+    if (dm.securejoinDone) store.setDm(dmKey, { ...store.getDm(dmKey), securejoinDone: false });
+    if (dm.userAAccountId && dm.userBAccountId) bootstrapDmKeys(dmKey, dm.userAAccountId, dm.userBAccountId);
+    return 'wait';
+  }
+
+  const quote = await resolveQuote(item.replyTo, {
+    chatIds: [...new Set([chatId, ...known].filter(Boolean))],
+    getMessage: (id) => dc.getMessage(accountId, id),
+    recentMessages: async () => {
+      const ids = (await dc.getMessageIds(accountId, chatId)).slice(-200).reverse();
+      return (await loadMessagesById(accountId, ids)).filter(Boolean);
+    },
+  });
+
+  try {
+    const realId = await dc.sendTextMsg(accountId, chatId, item.text, quote.quotedMessageId ?? null, quote.quotedText ?? null);
+    // DC can still create a cleartext copy if the key vanished in between; never let that count as sent.
+    const padlock = await dc.getMessage(accountId, realId).then((m) => m?.showPadlock !== false).catch(() => true);
+    if (!padlock) {
+      await dc.deleteMessages(accountId, [realId]).catch(() => {});
+      return 'wait';
+    }
+    store.replaceDmMessageId(dmKey, item.localId, realId);
+    markOutgoing(accountId, realId);
+    sseBroadcast(`dm:${dmKey}`, { type: 'message_id_updated', localId: item.localId, realId });
+    const cur = store.getDm(dmKey);
+    if (cur) store.setDm(dmKey, { ...addDmChatId(cur, isA ? 'A' : 'B', chatId), securejoinDone: true });
+    return 'sent';
+  } catch (e) {
+    const emsg = String(e.message || '').toLowerCase();
+    if (emsg.includes('key is missing') || emsg.includes('cannot send')) return 'wait';
+    console.error(`[dm send] ${dmKey}:`, e.message);
+    return 'failed';
+  }
+}
+
+async function flushUserSends(dmKey) {
+  if (_userFlushing.get(dmKey) || !pendingUserSends(dmKey).length) return;
+  _userFlushing.set(dmKey, true);
+  try {
+    while (pendingUserSends(dmKey).length) {
+      const item = pendingUserSends(dmKey)[0];
+      const outcome = await sendQueuedUserMessage(dmKey, item);
+      if (outcome === 'wait') break;
+      setPendingUserSends(dmKey, pendingUserSends(dmKey).filter((p) => p.localId !== item.localId));
+      if (outcome === 'failed') failDmMessage(dmKey, item.localId);
+    }
+  } finally {
+    _userFlushing.delete(dmKey);
+  }
+}
+
+function scheduleUserFlush(dmKey) {
+  if (_userRetryTimers.has(dmKey)) return; // loop already running
+  let attempt = 0;
+  const arm = (delay) => {
+    const t = setTimeout(tick, delay);
+    t.unref?.();
+    _userRetryTimers.set(dmKey, t);
+  };
+  const tick = async () => {
+    await flushUserSends(dmKey).catch(() => {});
+    const left = pendingUserSends(dmKey);
+    if (left.length && attempt < USER_SEND_ATTEMPTS) return arm(Math.min(4_000 * 1.4 ** attempt++, 30_000));
+    _userRetryTimers.delete(dmKey);
+    if (left.length) {
+      console.warn(`[dm send] gave up on ${left.length} message(s) for ${dmKey}: no encrypted chat`);
+      setPendingUserSends(dmKey, []);
+      left.forEach((p) => failDmMessage(dmKey, p.localId));
+    }
+  };
+  arm(4_000);
+}
+
+// The mail server or DC refused a message after it was handed over.
+dc.on('MsgFailed', (contextId, e) => {
+  const dmKey = store.findDmKeyByChatId(e.chatId, contextId);
+  if (!dmKey) return;
+  console.warn(`[dm send] delivery failed for ${dmKey} (account ${contextId}, msg ${e.msgId})`);
+  failDmMessage(dmKey, e.msgId);
+});
 
 // ── External-contact securejoin ──────────────────────────────────────
 // For DMs with an external Delta Chat user we control only the Serey side, so
@@ -1001,7 +1161,7 @@ function formatMessage(msg) {
     const qt = msg.quote.text;
     const qm = qt.match(MSG_RE);
     replyTo = {
-      id: msg.quote.msgId || null,
+      id: msg.quote.messageId ?? msg.quote.msgId ?? null,
       text: (qm ? qm[2] : qt).substring(0, 200),
       senderUsername: qm ? qm[1] : (msg.quote.authorDisplayName || null),
     };
@@ -1035,17 +1195,7 @@ function formatDmMessage(msg, dm, viewerUsername) {
   if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => (msg.text || '').toLowerCase().includes(s))) {
     return { id: msg.id, text: msg.text || '', senderUsername: null, isSystem: true, isEdited: false, timestamp: msg.timestamp, chatId: msg.chatId, replyTo: null };
   }
-  let replyTo = null;
-  if (msg.quote?.text) {
-    // DC leaves authorDisplayName empty for the account owner's own outgoing messages.
-    // In a 1:1 DM there are only two participants, so empty = the viewer sent it.
-    const quoteAuthor = msg.quote.authorDisplayName || viewerUsername;
-    replyTo = {
-      id: msg.quote.msgId || null,
-      text: msg.quote.text.substring(0, 200),
-      senderUsername: quoteAuthor,
-    };
-  }
+  const replyTo = quoteToReply(msg.quote, viewerUsername);
   // DC message state > 16 = outgoing (18=preparing,19=draft,20=pending,24=failed,26=delivered,28=read)
   const senderUsername = (msg.state > 16)
     ? viewerUsername
@@ -1061,6 +1211,7 @@ function formatDmMessage(msg, dm, viewerUsername) {
     timestamp: msg.timestamp,
     chatId: msg.chatId,
     replyTo,
+    ...(msg.state === 24 ? { failed: true } : {}),
   };
 }
 
@@ -2582,76 +2733,14 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
     res.json({ msgId: localId });
 
-    const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
-    const recipientUser = dm.userA === sender_username ? dm.userB : dm.userA;
-    const recipientInfo = store.getAccount(recipientUser);
-    (async () => {
-      // Await startIo so IO is confirmed running before sendTextMsg queues the
-      // message — otherwise a cold account leaves the message in the outbox for
-      // up to startAllUserIo interval before SMTP delivery begins.
-      await dc.rpc.startIo(senderInfo.accountId).catch((e) => {
-        console.warn('[/dm/:key/send] startIo sender failed:', e.message);
-      });
-      // Await bootstrap before sending — chatmail silently drops unencrypted
-      // messages with no error, so fire-and-forget causes the first message to
-      // vanish. res.json is already sent, so this wait is invisible to the user.
-      if (!dm.securejoinDone && recipientInfo?.accountId) {
-        await bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId).catch(() => {});
-      }
-      const isUserA = dm.userA === sender_username;
-      // Re-read from store after bootstrap — securejoin stores the verified chatId.
-      // Do NOT call resolveCanonicalChatId when we have a stored chatId: DC's
-      // createChatByContactId returns the OLD pre-securejoin chat (key missing),
-      // not the verified securejoin chat.
-      const freshChatId = store.getDmAccountAndChat(dm_key, sender_username)?.chatId;
-      const canonical = freshChatId
-        ? 0
-        : (recipientInfo?.addr && senderInfo?.accountId)
-          ? await resolveCanonicalChatId(senderInfo.accountId, recipientInfo.addr, dm_key, isUserA)
-          : 0;
-      const sendChatId = freshChatId || canonical || senderInfo.chatId;
-      if (!sendChatId) {
-        console.error('[/dm/:key/send] no valid chatId for', dm_key, sender_username);
-        sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
-        return;
-      }
-      // Keep sender IO alive for the linger window so SMTP delivery
-      // completes even if there is no SSE client holding a ref.
-      ioSendLinger(senderInfo.accountId);
-      try {
-        const realId = await dc.sendTextMsg(senderInfo.accountId, sendChatId, text, replyToId);
-        store.replaceDmMessageId(dm_key, localId, realId);
-        markOutgoing(senderInfo.accountId, realId);
-        sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId });
-      } catch (e) {
-        console.error('[/dm/:key/send]', e.message);
-        // Common failure when securejoin/Autocrypt keys are missing. Attempt
-        // one bootstrap + retry when the RPC reports a missing key for this chat.
-        const emsg = String(e.message || '').toLowerCase();
-        if (emsg.includes('key is missing') || emsg.includes('cannot send to chat#')) {
-          try {
-            console.log(`[/dm/:key/send] key missing; attempting securejoin for ${dm_key}`);
-            await bootstrapDmKeys(dm_key, dm.userAAccountId, dm.userBAccountId);
-            const refreshedSenderInfo = store.getDmAccountAndChat(dm_key, sender_username) || senderInfo;
-            // After bootstrap, canonical chatId is resolved — use it directly.
-            const retrySendChatId = refreshedSenderInfo.chatId
-              || (recipientInfo?.addr
-                ? await resolveCanonicalChatId(senderInfo.accountId, recipientInfo.addr, dm_key, isUserA).catch(() => 0)
-                : 0);
-            if (retrySendChatId) {
-              const realId2 = await dc.sendTextMsg(senderInfo.accountId, retrySendChatId, text, replyToId);
-              store.replaceDmMessageId(dm_key, localId, realId2);
-              markOutgoing(senderInfo.accountId, realId2);
-              sseBroadcast(`dm:${dm_key}`, { type: 'message_id_updated', localId, realId: realId2 });
-              return;
-            }
-          } catch (e2) {
-            console.error('[/dm/:key/send retry]', e2.message);
-          }
-        }
-        sseBroadcast(`dm:${dm_key}`, { type: 'message_send_failed', localId });
-      }
-    })();
+    queueUserSend(dm_key, {
+      localId,
+      text,
+      sender: sender_username,
+      replyTo: reply_to?.id || reply_to?.text ? { id: reply_to.id ?? null, text: reply_to.text || '' } : null,
+    });
+    flushUserSends(dm_key).catch(() => {});
+    scheduleUserFlush(dm_key);
   } catch (e) {
     console.error('[/dm/:key/send]', e.message);
     if (!res.headersSent) res.status(500).json({ error: e.message });
@@ -2669,8 +2758,8 @@ async function loadDmPage(accountId, chatIds, dmKey, dm, viewerUser, opts) {
     chatIds.map((cid) => dc.getMessageIds(accountId, cid).catch(() => []))
   );
   const { page, hasMore, nextBefore } = pageIds(idSets.flat(), opts);
-  const messages = (await loadMessagesById(accountId, page))
-    .map((msg) => formatDmMessage(msg, dm, viewerUser));
+  const messages = unlinkMismatchedQuotes((await loadMessagesById(accountId, page))
+    .map((msg) => formatDmMessage(msg, dm, viewerUser)));
   if (opts.before) return { messages: chronological(messages), hasMore, nextBefore };
 
   const merged = mergeDmMessages(messages, store.getDmCachedMessages(dmKey));
@@ -3153,6 +3242,9 @@ async function start() {
   await reconcileExternalDms(); // re-file external DMs that landed under the wrong user
 
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
+  for (const [dmKey, dm] of Object.entries(store.data.directMessages)) {
+    if (dm.pendingSends?.length) scheduleUserFlush(dmKey);
+  }
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
   setInterval(startAllUserIo, 30_000).unref(); // bot keepalive only
 

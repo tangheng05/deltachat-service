@@ -28,6 +28,10 @@ export class DeltaChatClient extends EventEmitter {
       this.emit('MsgsChanged', contextId, event);
     });
 
+    for (const kind of ['SecurejoinInviterProgress', 'SecurejoinJoinerProgress', 'MsgFailed']) {
+      this._dc.on(kind, (contextId, event) => this.emit(kind, contextId, event));
+    }
+
     console.log(`[dc-rpc] started (accounts path: ${this.accountsPath})`);
   }
 
@@ -100,9 +104,10 @@ export class DeltaChatClient extends EventEmitter {
 
   // ── Messages ─────────────────────────────────────────────────────
 
-  sendTextMsg(accountId, chatId, text, quotedMsgId = null) {
+  sendTextMsg(accountId, chatId, text, quotedMsgId = null, quotedText = null) {
     const msg = { text };
     if (quotedMsgId && typeof quotedMsgId === 'number') msg.quotedMessageId = quotedMsgId;
+    else if (quotedText) msg.quotedText = quotedText;
     return this._dc.rpc.sendMsg(accountId, chatId, msg);
   }
 

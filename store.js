@@ -456,6 +456,13 @@ export class Store {
     this._save();
   }
 
+  markDmMessageFailed(dmKey, id) {
+    const msg = this.data.directMessages[dmKey]?.messageCache?.find((m) => m.id === id);
+    if (!msg || msg.failed) return;
+    msg.failed = true;
+    this._save();
+  }
+
   replaceDmMessageId(dmKey, localId, realId) {
     const dm = this.data.directMessages[dmKey];
     if (!dm?.messageCache?.length) return;
@@ -572,7 +579,7 @@ export class Store {
     const mutedDms = this.data.moderation.mutedDms[username] ?? [];
     return Object.entries(this.data.directMessages)
       .filter(([, info]) => info.userA === username || info.userB === username || info.sereUser === username)
-      .map(([dmKey, { messageCache, ...info }]) => {
+      .map(([dmKey, { messageCache, pendingSends, ...info }]) => {
         if (info.dcExternal) {
           return {
             dmKey, ...info,
