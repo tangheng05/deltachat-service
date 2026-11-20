@@ -44,6 +44,7 @@ export function formatGroupMessage(msg, { selfAddr, selfUsername, usernameByAddr
     senderName: senderUsername || msg.sender?.displayName || address || null,
     isSystem: !!msg.isInfo,
     isMine,
+    isEdited: !!msg.isEdited,
     image: isImage(msg),
     timestamp: msg.timestamp,
     replyTo: quoteToReply(msg.quote, selfUsername),

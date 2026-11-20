@@ -149,3 +149,8 @@ test('a message carries who sent it, for their Delta Chat picture', () => {
   assert.strictEqual(m.senderContactId, 12);
   assert.strictEqual(m.senderHasPicture, true);
 });
+
+test('formatGroupMessage marks edited messages', () => {
+  assert.strictEqual(formatGroupMessage(msg({ isEdited: true }), ctx).isEdited, true);
+  assert.strictEqual(formatGroupMessage(msg(), ctx).isEdited, false);
+});

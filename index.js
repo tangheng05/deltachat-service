@@ -1197,7 +1197,10 @@ dc.on('MsgDeleted', (contextId, event) => {
                   :  dmKey      ? `dm:${dmKey}`
                   : null;
 
-    if (!chatKey) return;
+    if (!chatKey) {
+      if (!isBot && chatId) dcgRefreshSoon(contextId, chatId);
+      return;
+    }
 
     if (dmKey) store.removeDmCachedMessage(dmKey, msgId);
     const payload = { type: 'message_deleted', id: msgId };
@@ -1890,6 +1893,67 @@ app.post('/dc-groups/:username/:chatId/send', async (req, res) => {
   } catch (e) {
     console.error('[dc-groups] send', username, chatId, e.message);
     if (!res.headersSent) res.status(503).json({ error: 'Chat service busy, retry' });
+  }
+});
+
+// Your own message in this group, or null.
+async function ownGroupMessage(acc, chatId, msgId) {
+  const msg = msgId ? await dc.getMessage(acc.accountId, msgId).catch(() => null) : null;
+  return msg && msg.chatId === chatId && msg.fromId === 1 && !msg.isInfo ? msg : null;
+}
+
+app.post('/dc-groups/:username/:chatId/edit', async (req, res) => {
+  const { username } = req.params;
+  const chatId = Number(req.params.chatId);
+  const msgId = Number(req.body?.msgId);
+  const text = String(req.body?.text || '').trim();
+  const acc = dcgAccount(username);
+  if (!acc || !chatId) return res.status(404).json({ error: 'Group not found' });
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (text.length > 5000) return res.status(400).json({ error: 'Message is too long.' });
+  try {
+    const chat = await dcgChat(acc.accountId, chatId);
+    if (!chat || dcgState(username, chat) !== 'active') return res.status(403).json({ error: 'You can no longer write in this group.' });
+    if (!(await ownGroupMessage(acc, chatId, msgId))) return res.status(403).json({ error: 'You can only edit your own messages.' });
+    await dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId);
+    await withTimeout(dc.rpc.sendEditRequest(acc.accountId, msgId, text), 15_000, 'dcg/edit');
+    sseBroadcast(`dcgroup:${username}:${chatId}`, { type: 'message_edited', id: msgId, text });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[dc-groups] edit', username, chatId, e.message);
+    res.status(503).json({ error: 'Could not edit the message. Try again.' });
+  }
+});
+
+// Deletes for everyone in the group; a message still waiting to send is just dropped.
+app.post('/dc-groups/:username/:chatId/delete', async (req, res) => {
+  const { username } = req.params;
+  const chatId = Number(req.params.chatId);
+  const msgId = Number(req.body?.msgId);
+  const acc = dcgAccount(username);
+  if (!acc || !chatId || !msgId) return res.status(404).json({ error: 'Group not found' });
+  const key = dcgKey(username, chatId);
+  const queued = store.getDcGroupSends(key).find((p) => p.localId === msgId);
+  if (queued) {
+    store.setDcGroupSends(key, store.getDcGroupSends(key).filter((p) => p.localId !== msgId));
+    dropOutboxPhoto(queued);
+    sseBroadcast(`dcgroup:${username}:${chatId}`, { type: 'message_deleted', id: msgId });
+    return res.json({ ok: true });
+  }
+  try {
+    const chat = await dcgChat(acc.accountId, chatId);
+    if (!chat) return res.status(404).json({ error: 'Group not found' });
+    if (!(await ownGroupMessage(acc, chatId, msgId))) return res.status(403).json({ error: 'You can only delete your own messages.' });
+    await dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId);
+    if (dcgState(username, chat) === 'active') await withTimeout(dc.rpc.deleteMessagesForAll(acc.accountId, [msgId]), 15_000, 'dcg/delete');
+    else await dc.deleteMessages(acc.accountId, [msgId]);
+    sseBroadcast(`dcgroup:${username}:${chatId}`, { type: 'message_deleted', id: msgId });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[dc-groups] delete', username, chatId, e.message);
+    res.status(503).json({ error: 'Could not delete the message. Try again.' });
   }
 });
 
