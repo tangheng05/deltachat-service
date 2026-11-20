@@ -34,7 +34,8 @@ const dc = new DeltaChatClient(DC_ACCOUNTS_PATH);
 const store = new Store(join(DC_ACCOUNTS_PATH, 'store.json'));
 
 // Photos sent from the web wait here until Delta Chat has sent them.
-const OUTBOX_DIR = join(DC_ACCOUNTS_PATH, 'outbox');
+// Not inside DC_ACCOUNTS_PATH: the engine refuses to start in a non-empty new folder.
+const OUTBOX_DIR = join(__dirname, 'outbox');
 mkdirSync(OUTBOX_DIR, { recursive: true });
 
 function saveOutboxPhoto(photo) {
