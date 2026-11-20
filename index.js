@@ -12,7 +12,7 @@ import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
 import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
-import { groupState, formatGroupMessage, isShownMessage, joinConfirmed, plainInfo } from './dc-groups.js';
+import { groupState, formatGroupMessage, isShownMessage, joinConfirmed, plainInfo, formatMembers } from './dc-groups.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -1720,7 +1720,8 @@ app.get('/dc-groups/:username/:chatId/messages', async (req, res) => {
         messages.push({ id: p.localId, text: p.text, senderUsername: username, senderName: username, isSystem: false, isMine: true, image: false, timestamp: p.at || nowSec, replyTo: p.replyTo || null, failed: !!p.failed, pending: !p.failed });
       }
     }
-    res.json({ messages, hasMore, nextBefore, name: chat.name, hasAvatar: !!chat.avatarPath, state: dcgState(username, chat) });
+    const full = await dc.rpc.getFullChatById(acc.accountId, chatId).catch(() => null);
+    res.json({ messages, hasMore, nextBefore, name: chat.name, hasAvatar: !!chat.avatarPath, memberCount: full?.contactIds?.length || 0, state: dcgState(username, chat) });
   } catch (e) {
     console.error('[dc-groups] messages', username, chatId, e.message);
     res.status(503).json({ error: 'Chat service busy, retry' });
@@ -1741,6 +1742,21 @@ app.get('/dc-groups/:username/:chatId/image/:msgId', async (req, res) => {
     createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
   } catch {
     res.status(404).end();
+  }
+});
+
+app.get('/dc-groups/:username/:chatId/members', async (req, res) => {
+  const { username } = req.params;
+  const acc = dcgAccount(username);
+  const chatId = Number(req.params.chatId);
+  if (!acc || !chatId || !(await dcgChat(acc.accountId, chatId).catch(() => null))) return res.status(404).json({ error: 'Group not found' });
+  try {
+    const full = await withTimeout(dc.rpc.getFullChatById(acc.accountId, chatId), 8_000, 'dcg/full');
+    const contacts = await withTimeout(dc.rpc.getContactsByIds(acc.accountId, full.contactIds || []), 8_000, 'dcg/contacts');
+    res.json({ members: formatMembers(contacts, { selfUsername: username, usernameByAddr: usernameByAddrMap() }) });
+  } catch (e) {
+    console.error('[dc-groups] members', username, chatId, e.message);
+    res.status(503).json({ error: 'Chat service busy, retry' });
   }
 });
 

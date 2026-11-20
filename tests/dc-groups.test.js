@@ -127,3 +127,18 @@ test('a hidden engine line is not shown, a plain one is', async () => {
   assert.strictEqual(isShownMessage(shown), true);
   assert.strictEqual(formatGroupMessage(shown, ctx).text, 'Sok added you');
 });
+
+test('members list: you first, Serey users by Serey name, others by Delta Chat name', async () => {
+  const { formatMembers } = await import('../dc-groups.js');
+  const contacts = {
+    1: { id: 1, address: 'me@chat.serey.io', displayName: 'Me' },
+    11: { id: 11, address: 'heng@chat.serey.io', displayName: 'Heng phone' },
+    12: { id: 12, address: 'x@nine.testrun.org', displayName: 'Sok' },
+  };
+  const out = formatMembers(contacts, { selfUsername: 'jelly', usernameByAddr: (a) => ({ 'heng@chat.serey.io': 'hengthegoat' })[a] || null });
+  assert.deepStrictEqual(out, [
+    { name: 'jelly', username: 'jelly', isMe: true },
+    { name: 'hengthegoat', username: 'hengthegoat', isMe: false },
+    { name: 'Sok', username: null, isMe: false },
+  ]);
+});

@@ -56,3 +56,13 @@ export function formatGroupMessage(msg, { selfAddr, selfUsername, usernameByAddr
 // DC contact ids up to 9 are special (1 = self, 2 = info). A message from any
 // real contact means the owner has let us in, even if the join event was missed.
 export const joinConfirmed = (messages) => messages.some((m) => (m?.fromId || 0) > 9);
+
+// DC contact id 1 is always the account itself.
+export function formatMembers(contactsById, { selfUsername, usernameByAddr }) {
+  const members = Object.values(contactsById).map((c) => {
+    if (c.id === 1) return { name: selfUsername, username: selfUsername, isMe: true };
+    const username = usernameByAddr(c.address) || null;
+    return { name: username || c.displayName || c.address, username, isMe: false };
+  });
+  return members.sort((a, b) => (b.isMe - a.isMe) || a.name.localeCompare(b.name));
+}
