@@ -1,4 +1,5 @@
 // Small decisions used by the DM send and read paths, kept free of DC so they can be tested.
+import { isImage } from './chat-image.js';
 
 // DC labels the account owner's own messages "Me" (or leaves the name empty).
 const SELF_LABELS = new Set(['', 'Me']);
@@ -35,6 +36,10 @@ export async function pickEncryptedChat(candidates, isEncrypted) {
 // user's copy. Only quote by id when it is this chat's message with this text.
 export async function resolveQuote(replyTo, { chatIds, getMessage, recentMessages }) {
   const text = replyTo?.text || '';
+  if (replyTo?.image && !text) {
+    const byId = typeof replyTo.id === 'number' ? await getMessage(replyTo.id).catch(() => null) : null;
+    return byId && chatIds.includes(byId.chatId) && isImage(byId) ? { quotedMessageId: replyTo.id } : { quotedText: 'Photo' };
+  }
   if (!replyTo || (!text && typeof replyTo.id !== 'number')) return {};
   const fits = (m) => m && chatIds.includes(m.chatId) && (!text || (m.text || '').startsWith(text));
   if (typeof replyTo.id === 'number') {

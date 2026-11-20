@@ -97,3 +97,23 @@ test('quoteToReply shows a quoted photo as plain "Photo", keeping any caption', 
   const plain = quoteToReply({ kind: 'WithMessage', text: '📷 not a photo', messageId: 9, authorDisplayName: 'rex', viewType: 'Text' }, 'x');
   assert.strictEqual(plain.text, '📷 not a photo');
 });
+
+const photoChat = {
+  30: { chatId: 21, text: '', viewType: 'Image', file: '/b/a.jpg' },
+  31: { chatId: 21, text: '', viewType: 'Text', file: null },
+  32: { chatId: 21, text: '', viewType: 'Image', file: '/b/b.jpg' },
+};
+const photoDeps = {
+  chatIds: [21],
+  getMessage: async (id) => { if (!photoChat[id]) throw new Error('no such message'); return photoChat[id]; },
+  recentMessages: async () => [32, 31, 30].map((id) => ({ id, ...photoChat[id] })),
+};
+
+test('a photo is quoted by id only when that id is a photo in this chat', async () => {
+  assert.deepStrictEqual(await resolveQuote({ id: 30, text: '', image: true }, photoDeps), { quotedMessageId: 30 });
+  assert.deepStrictEqual(await resolveQuote({ id: 31, text: '', image: true }, photoDeps), { quotedText: 'Photo' });
+});
+
+test('a photo quote whose id is unknown here keeps a plain "Photo" quote instead of guessing', async () => {
+  assert.deepStrictEqual(await resolveQuote({ id: 1795167403594, text: '', image: true }, photoDeps), { quotedText: 'Photo' });
+});

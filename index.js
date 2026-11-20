@@ -1879,7 +1879,7 @@ app.post('/dc-groups/:username/:chatId/send', async (req, res) => {
       localId: Date.now(),
       at: Math.floor(Date.now() / 1000),
       text,
-      replyTo: r?.id || r?.text ? { id: r.id ?? null, text: String(r.text || '').slice(0, 200), senderUsername: r.senderUsername || null } : null,
+      replyTo: r?.id || r?.text ? { id: r.id ?? null, text: String(r.text || '').slice(0, 200), senderUsername: r.senderUsername || null, image: !!r.image } : null,
       ...(photo ? { image: saveOutboxPhoto(photo) } : {}),
     };
     const key = dcgKey(username, chatId);
@@ -3288,7 +3288,8 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       const replyTo = reply_to?.id
         ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null }
         : null;
-      const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
+      // Web-side local ids are timestamps and would overflow DC's message id.
+      const replyToId = (typeof reply_to?.id === 'number' && reply_to.id > 0 && reply_to.id < 2 ** 31) ? reply_to.id : null;
       sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
       store.setDmLastMessage(dm_key, { text: preview, senderUsername: sender_username, timestamp: nowSec });
       store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
@@ -3344,7 +3345,7 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
       text,
       ...(photo ? { image: saveOutboxPhoto(photo) } : {}),
       sender: sender_username,
-      replyTo: reply_to?.id || reply_to?.text ? { id: reply_to.id ?? null, text: reply_to.text || '' } : null,
+      replyTo: reply_to?.id || reply_to?.text ? { id: reply_to.id ?? null, text: reply_to.text || '', image: !!reply_to.image } : null,
     });
     flushUserSends(dm_key).catch(() => {});
     scheduleUserFlush(dm_key);
@@ -3487,34 +3488,40 @@ app.get('/dm/:dm_key/image/:msgId', async (req, res) => {
   const msgId = Number(req.params.msgId);
   const dm = store.getDm(dm_key);
   if (!dm || !msgId || !username) return res.status(404).end();
-  const queued = [...pendingUserSends(dm_key), ...(_extPendingSends.get(dm_key) || [])].find((p) => p.localId === msgId);
-  if (queued) return (dm.dcExternal || queued.sender === username) ? sendOutboxPhoto(res, queued) : res.status(404).end();
-
-  let accountId, chatIds, otherAddr;
+  // Both participants see one shared copy before delivery, so either side's copy may be asked for.
+  let sides;
   if (dm.dcExternal) {
     if (username !== dm.sereUser) return res.status(404).end();
-    accountId = dm.sereAccountId;
-    chatIds = [dm.chatId, ...(dm.chatIds || [])];
-    otherAddr = dm.extAddr;
+    sides = [{ accountId: dm.sereAccountId, chatIds: [dm.chatId, ...(dm.chatIds || [])], otherAddr: dm.extAddr }];
   } else if (username === dm.userA || username === dm.userB) {
-    const isA = username === dm.userA;
-    accountId = isA ? dm.userAAccountId : dm.userBAccountId;
-    chatIds = [isA ? dm.userAChatId : dm.userBChatId, ...((isA ? dm.userAChatIds : dm.userBChatIds) || [])];
-    otherAddr = store.getAccount(isA ? dm.userB : dm.userA)?.addr;
+    sides = [['A', 'B'], ['B', 'A']].map(([me, other]) => ({
+      accountId: dm[`user${me}AccountId`],
+      chatIds: [dm[`user${me}ChatId`], ...(dm[`user${me}ChatIds`] || [])],
+      otherAddr: store.getAccount(dm[`user${other}`])?.addr,
+    }));
+    if (username === dm.userB) sides.reverse();
+  } else {
+    return res.status(404).end();
   }
-  if (!accountId) return res.status(404).end();
+  const queued = [...pendingUserSends(dm_key), ...(_extPendingSends.get(dm_key) || [])].find((p) => p.localId === msgId);
+  if (queued) return sendOutboxPhoto(res, queued);
+
   try {
-    const msg = await dc.getMessage(accountId, msgId);
-    if (!isImage(msg)) return res.status(404).end();
-    let inDm = chatIds.includes(msg.chatId);
-    if (!inDm && otherAddr) {
-      const contactId = await dc.lookupContactIdByAddr(accountId, otherAddr).catch(() => 0);
-      inDm = !!contactId && (await dc.createChatByContactId(accountId, contactId).catch(() => 0)) === msg.chatId;
+    for (const { accountId, chatIds, otherAddr } of sides) {
+      if (!accountId) continue;
+      const msg = await dc.getMessage(accountId, msgId).catch(() => null);
+      if (!isImage(msg)) continue;
+      let inDm = chatIds.includes(msg.chatId);
+      if (!inDm && otherAddr) {
+        const contactId = await dc.lookupContactIdByAddr(accountId, otherAddr).catch(() => 0);
+        inDm = !!contactId && (await dc.createChatByContactId(accountId, contactId).catch(() => 0)) === msg.chatId;
+      }
+      if (!inDm) continue;
+      res.setHeader('Content-Type', msg.fileMime || 'application/octet-stream');
+      res.setHeader('Cache-Control', 'private, max-age=86400');
+      return createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
     }
-    if (!inDm) return res.status(404).end();
-    res.setHeader('Content-Type', msg.fileMime || 'application/octet-stream');
-    res.setHeader('Cache-Control', 'private, max-age=86400');
-    createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
+    res.status(404).end();
   } catch {
     res.status(404).end();
   }
