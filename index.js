@@ -1493,9 +1493,9 @@ async function dcgChat(accountId, chatId) {
 const dcgState = (username, item) =>
   groupState({ canSend: item.isSelfInGroup, joinPending: isJoinPending(username, item.id) });
 
-function dcgNotify(username, chatId, payload) {
+function dcgNotify(username, chatId, payload, extra = {}) {
   if (payload) sseBroadcast(`dcgroup:${username}:${chatId}`, payload);
-  sseBroadcast(`user:${username}`, { type: 'dc_group_updated', chatId });
+  sseBroadcast(`user:${username}`, { type: 'dc_group_updated', chatId, ...extra });
 }
 
 // Live updates from a user account's group chat. Returns true when handled.
@@ -1518,7 +1518,17 @@ async function routeDcGroupEvent(contextId, chatId, msgId) {
       payload = formatGroupMessage(msg, { selfAddr: store.getAccount(username)?.addr, selfUsername: username, usernameByAddr: usernameByAddrMap() });
     }
   }
-  dcgNotify(username, chatId, payload);
+  // A new message from someone else: enough for the website to ring and show a toast.
+  let extra = {};
+  if (payload.id != null && !payload.isSystem && !payload.isMine) {
+    const chat = await dcgChat(contextId, chatId).catch(() => null);
+    extra = {
+      incoming: true,
+      groupName: chat?.name || '',
+      lastMessage: { id: payload.id, text: payload.text || (payload.image ? 'Photo' : ''), senderName: payload.senderName },
+    };
+  }
+  dcgNotify(username, chatId, payload, extra);
   return true;
 }
 
