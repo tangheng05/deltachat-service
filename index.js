@@ -12,7 +12,7 @@ import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
 import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
-import { groupState, formatGroupMessage, isShownMessage, joinConfirmed } from './dc-groups.js';
+import { groupState, formatGroupMessage, isShownMessage, joinConfirmed, plainInfo } from './dc-groups.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -1684,9 +1684,9 @@ app.get('/dc-groups/:username', async (req, res) => {
     const groups = await Promise.all(items.map(async (it) => {
       const last = it.lastMessageId ? await dc.getMessage(acc.accountId, it.lastMessageId).catch(() => null) : null;
       const lastMessage = last && isShownMessage(last)
-        ? { text: last.text || (last.viewType ? 'Photo' : ''), senderName: last.isInfo ? null : last.sender?.displayName || null, timestamp: last.timestamp }
+        ? { text: last.isInfo ? plainInfo(last.text) : last.text || 'Photo', senderName: last.isInfo ? null : last.sender?.displayName || null, timestamp: last.timestamp }
         : null;
-      return { chatId: it.id, name: it.name, state: dcgState(username, it), unread: it.freshMessageCounter || 0, lastMessage, lastUpdated: it.lastUpdated || 0 };
+      return { chatId: it.id, name: it.name, hasAvatar: !!it.avatarPath, state: dcgState(username, it), unread: it.freshMessageCounter || 0, lastMessage, lastUpdated: it.lastUpdated || 0 };
     }));
     groups.sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
     res.json({ groups });
@@ -1720,7 +1720,7 @@ app.get('/dc-groups/:username/:chatId/messages', async (req, res) => {
         messages.push({ id: p.localId, text: p.text, senderUsername: username, senderName: username, isSystem: false, isMine: true, image: false, timestamp: p.at || nowSec, replyTo: p.replyTo || null, failed: !!p.failed, pending: !p.failed });
       }
     }
-    res.json({ messages, hasMore, nextBefore, name: chat.name, state: dcgState(username, chat) });
+    res.json({ messages, hasMore, nextBefore, name: chat.name, hasAvatar: !!chat.avatarPath, state: dcgState(username, chat) });
   } catch (e) {
     console.error('[dc-groups] messages', username, chatId, e.message);
     res.status(503).json({ error: 'Chat service busy, retry' });
@@ -1739,6 +1739,24 @@ app.get('/dc-groups/:username/:chatId/image/:msgId', async (req, res) => {
     res.setHeader('Content-Type', msg.fileMime || 'application/octet-stream');
     res.setHeader('Cache-Control', 'private, max-age=86400');
     createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
+  } catch {
+    res.status(404).end();
+  }
+});
+
+// The group's own picture, as set in the Delta Chat app.
+const AVATAR_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+app.get('/dc-groups/:username/:chatId/avatar', async (req, res) => {
+  const acc = dcgAccount(req.params.username);
+  const chatId = Number(req.params.chatId);
+  if (!acc || !chatId) return res.status(404).end();
+  try {
+    const chat = await dcgChat(acc.accountId, chatId);
+    const type = AVATAR_TYPES[String(chat?.avatarPath || '').split('.').pop().toLowerCase()];
+    if (!chat?.avatarPath || !type) return res.status(404).end();
+    res.setHeader('Content-Type', type);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    createReadStream(chat.avatarPath).on('error', () => res.destroy()).pipe(res);
   } catch {
     res.status(404).end();
   }

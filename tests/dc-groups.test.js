@@ -102,3 +102,28 @@ test('a left group is hidden until it is joined again', async () => {
   assert.strictEqual(s.isDcGroupHidden('boss', 17), false);
   clearTimeout(s._saveTimer);
 });
+
+test('engine lines are hidden or put in plain words', async () => {
+  const { plainInfo } = await import('../dc-groups.js');
+  assert.strictEqual(plainInfo('Messages are end-to-end encrypted.'), null);
+  assert.strictEqual(plainInfo('hengthegoat invited you to join this group.\n\nWaiting for the device of hengthegoat to reply…'), null);
+  assert.strictEqual(plainInfo('hengthegoat replied, waiting for being added to the group…'), null);
+  assert.strictEqual(plainInfo('Member Me added by hengthegoat.'), 'hengthegoat added you');
+  assert.strictEqual(plainInfo('Member dara added by hengthegoat.'), 'hengthegoat added dara');
+  assert.strictEqual(plainInfo('Member dara added by me.'), 'You added dara');
+  assert.strictEqual(plainInfo('Member Me removed by Sok.'), 'Sok removed you');
+  assert.strictEqual(plainInfo('Member dara removed by Sok.'), 'Sok removed dara');
+  assert.strictEqual(plainInfo('Group left by dara.'), 'dara left the group');
+  assert.strictEqual(plainInfo('You left the group.'), 'You left the group');
+  assert.strictEqual(plainInfo('Group name changed from "A" to "B" by Sok.'), 'Group name changed from "A" to "B" by Sok.');
+});
+
+test('a hidden engine line is not shown, a plain one is', async () => {
+  const { formatGroupMessage, isShownMessage } = await import('../dc-groups.js');
+  const ctx = { selfAddr: 'me@x', selfUsername: 'boss', usernameByAddr: () => null };
+  const hidden = { id: 1, isInfo: true, text: 'Messages are end-to-end encrypted.', sender: {}, timestamp: 1 };
+  const shown = { id: 2, isInfo: true, text: 'Member Me added by Sok.', sender: { address: 's@x', displayName: 'Sok' }, timestamp: 2 };
+  assert.strictEqual(isShownMessage(hidden), false);
+  assert.strictEqual(isShownMessage(shown), true);
+  assert.strictEqual(formatGroupMessage(shown, ctx).text, 'Sok added you');
+});
