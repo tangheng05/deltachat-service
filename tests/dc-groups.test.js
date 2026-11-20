@@ -133,12 +133,19 @@ test('members list: you first, Serey users by Serey name, others by Delta Chat n
   const contacts = {
     1: { id: 1, address: 'me@chat.serey.io', displayName: 'Me' },
     11: { id: 11, address: 'heng@chat.serey.io', displayName: 'Heng phone' },
-    12: { id: 12, address: 'x@nine.testrun.org', displayName: 'Sok' },
+    12: { id: 12, address: 'x@nine.testrun.org', displayName: 'Sok', profileImage: '/blobs/sok.png' },
   };
   const out = formatMembers(contacts, { selfUsername: 'jelly', usernameByAddr: (a) => ({ 'heng@chat.serey.io': 'hengthegoat' })[a] || null });
   assert.deepStrictEqual(out, [
-    { name: 'jelly', username: 'jelly', isMe: true },
-    { name: 'hengthegoat', username: 'hengthegoat', isMe: false },
-    { name: 'Sok', username: null, isMe: false },
+    { contactId: 1, name: 'jelly', username: 'jelly', isMe: true, hasPicture: false },
+    { contactId: 11, name: 'hengthegoat', username: 'hengthegoat', isMe: false, hasPicture: false },
+    { contactId: 12, name: 'Sok', username: null, isMe: false, hasPicture: true },
   ]);
+});
+
+test('a message carries who sent it, for their Delta Chat picture', () => {
+  const ctx = { selfAddr: 'me@x', selfUsername: 'boss', usernameByAddr: () => null };
+  const m = formatGroupMessage({ id: 9, text: 'hi', fromId: 12, sender: { address: 's@x', displayName: 'Sok', profileImage: '/b.png' }, timestamp: 1 }, ctx);
+  assert.strictEqual(m.senderContactId, 12);
+  assert.strictEqual(m.senderHasPicture, true);
 });

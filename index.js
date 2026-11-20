@@ -1770,8 +1770,30 @@ app.get('/dc-groups/:username/:chatId/members', async (req, res) => {
   }
 });
 
-// The group's own picture, as set in the Delta Chat app.
 const AVATAR_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
+
+// A member's own Delta Chat picture; only for someone in this group.
+app.get('/dc-groups/:username/:chatId/people/:contactId/picture', async (req, res) => {
+  const acc = dcgAccount(req.params.username);
+  const chatId = Number(req.params.chatId);
+  const contactId = Number(req.params.contactId);
+  if (!acc || !chatId || !(contactId > 9)) return res.status(404).end();
+  try {
+    if (!(await dcgChat(acc.accountId, chatId))) return res.status(404).end();
+    const full = await dc.rpc.getFullChatById(acc.accountId, chatId);
+    if (!(full.contactIds || []).includes(contactId)) return res.status(404).end();
+    const contact = await dc.getContact(acc.accountId, contactId);
+    const type = AVATAR_TYPES[String(contact?.profileImage || '').split('.').pop().toLowerCase()];
+    if (!contact?.profileImage || !type) return res.status(404).end();
+    res.setHeader('Content-Type', type);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    createReadStream(contact.profileImage).on('error', () => res.destroy()).pipe(res);
+  } catch {
+    res.status(404).end();
+  }
+});
+
+// The group's own picture, as set in the Delta Chat app.
 app.get('/dc-groups/:username/:chatId/avatar', async (req, res) => {
   const acc = dcgAccount(req.params.username);
   const chatId = Number(req.params.chatId);
