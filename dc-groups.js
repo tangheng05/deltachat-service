@@ -1,8 +1,6 @@
 // Delta Chat groups live in the user's own DC account; these shape them for the web.
 import { quoteToReply } from './dm-send.js';
-
-const IMAGE_TYPES = new Set(['Image', 'Gif', 'Sticker']);
-const isImage = (msg) => IMAGE_TYPES.has(msg?.viewType) && !!msg?.file;
+import { isImage } from './chat-image.js';
 
 export function groupState({ canSend, joinPending }) {
   if (joinPending) return 'joining';

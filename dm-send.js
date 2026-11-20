@@ -11,7 +11,16 @@ export function quoteToReply(quote, viewerUsername) {
   const senderUsername = id == null && name == null
     ? null
     : SELF_LABELS.has(name ?? '') ? viewerUsername : name;
-  return { id, text: quote.text.substring(0, 200), senderUsername };
+  return { id, text: quoteText(quote).substring(0, 200), senderUsername };
+}
+
+const PHOTO_QUOTE_TYPES = new Set(['Image', 'Gif', 'Sticker']);
+
+// DC prefixes a quoted photo with an emoji and calls it "Image".
+function quoteText(quote) {
+  if (!PHOTO_QUOTE_TYPES.has(quote.viewType)) return quote.text;
+  const caption = quote.text.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, '');
+  return !caption || caption === 'Image' || caption === 'GIF' || caption === 'Sticker' ? 'Photo' : caption;
 }
 
 // chatmail refuses cleartext, so a message may only go out on an encrypted chat.

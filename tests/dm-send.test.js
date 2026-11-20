@@ -88,3 +88,12 @@ test('a failed message is only shown to its sender', async () => {
   assert.deepStrictEqual(hideUndelivered(msgs, 'heng').map((m) => m.id), [1, 3]);
   assert.deepStrictEqual(hideUndelivered(msgs, 'jelly').map((m) => m.id), [1, 2]);
 });
+
+test('quoteToReply shows a quoted photo as plain "Photo", keeping any caption', () => {
+  const photo = quoteToReply({ kind: 'WithMessage', text: '📷 Image', messageId: 9, authorDisplayName: 'rex', viewType: 'Image' }, 'x');
+  assert.strictEqual(photo.text, 'Photo');
+  const captioned = quoteToReply({ kind: 'WithMessage', text: '📷 at the beach', messageId: 9, authorDisplayName: 'rex', viewType: 'Image' }, 'x');
+  assert.strictEqual(captioned.text, 'at the beach');
+  const plain = quoteToReply({ kind: 'WithMessage', text: '📷 not a photo', messageId: 9, authorDisplayName: 'rex', viewType: 'Text' }, 'x');
+  assert.strictEqual(plain.text, '📷 not a photo');
+});

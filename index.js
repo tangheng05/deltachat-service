@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { randomBytes } from 'node:crypto';
-import { createReadStream, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
 import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
 import { groupState, formatGroupMessage, isShownMessage, joinConfirmed, plainInfo, formatMembers } from './dc-groups.js';
+import { isImage, decodeImage, photoPreview } from './chat-image.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -31,6 +32,45 @@ mkdirSync(DC_ACCOUNTS_PATH, { recursive: true });
 
 const dc = new DeltaChatClient(DC_ACCOUNTS_PATH);
 const store = new Store(join(DC_ACCOUNTS_PATH, 'store.json'));
+
+// Photos sent from the web wait here until Delta Chat has sent them.
+const OUTBOX_DIR = join(DC_ACCOUNTS_PATH, 'outbox');
+mkdirSync(OUTBOX_DIR, { recursive: true });
+
+function saveOutboxPhoto(photo) {
+  const path = join(OUTBOX_DIR, `${Date.now()}-${randomBytes(6).toString('hex')}.${photo.ext}`);
+  writeFileSync(path, photo.buf);
+  return { path, mime: photo.mime };
+}
+
+const dropOutboxPhoto = (item) => { if (item?.image?.path) rmSync(item.image.path, { force: true }); };
+
+function sendOutboxPhoto(res, item) {
+  if (!item?.image?.path || !existsSync(item.image.path)) return res.status(404).end();
+  res.setHeader('Content-Type', item.image.mime);
+  res.setHeader('Cache-Control', 'private, no-store');
+  createReadStream(item.image.path).on('error', () => res.destroy()).pipe(res);
+}
+
+// Leftovers from leaves, crashes or long-failed sends.
+setInterval(() => {
+  const cutoff = Date.now() - 7 * 24 * 3600_000;
+  for (const name of readdirSync(OUTBOX_DIR)) {
+    if (Number(name.split('-')[0]) < cutoff) rmSync(join(OUTBOX_DIR, name), { force: true });
+  }
+}, 24 * 3600_000).unref();
+
+// Sends a queued item; DC is handed a throwaway copy so a retry still has the photo.
+async function sendQueuedItem(accountId, chatId, item, quotedId = null, quotedText = null) {
+  if (!item.image?.path) return dc.sendTextMsg(accountId, chatId, item.text, quotedId, quotedText);
+  const copy = `${item.image.path}-${Date.now()}.${item.image.path.split('.').pop()}`;
+  copyFileSync(item.image.path, copy);
+  try {
+    return await dc.sendTextMsg(accountId, chatId, item.text || '', quotedId, quotedText, copy);
+  } finally {
+    rmSync(copy, { force: true });
+  }
+}
 
 // ── Middleware instances ─────────────────────────────────────────────
 const rateLimitMap = new Map();
@@ -543,7 +583,7 @@ async function sendQueuedUserMessage(dmKey, item) {
   });
 
   try {
-    const realId = await dc.sendTextMsg(accountId, chatId, item.text, quote.quotedMessageId ?? null, quote.quotedText ?? null);
+    const realId = await sendQueuedItem(accountId, chatId, item, quote.quotedMessageId ?? null, quote.quotedText ?? null);
     // DC can still create a cleartext copy if the key vanished in between; never let that count as sent.
     const padlock = await dc.getMessage(accountId, realId).then((m) => m?.showPadlock !== false).catch(() => true);
     if (!padlock) {
@@ -573,6 +613,7 @@ async function flushUserSends(dmKey) {
       const outcome = await sendQueuedUserMessage(dmKey, item);
       if (outcome === 'wait') break;
       setPendingUserSends(dmKey, pendingUserSends(dmKey).filter((p) => p.localId !== item.localId));
+      dropOutboxPhoto(item);
       if (outcome === 'failed') failDmMessage(dmKey, item.localId);
     }
   } finally {
@@ -596,7 +637,7 @@ function scheduleUserFlush(dmKey) {
     if (left.length) {
       console.warn(`[dm send] gave up on ${left.length} message(s) for ${dmKey}: no encrypted chat`);
       setPendingUserSends(dmKey, []);
-      left.forEach((p) => failDmMessage(dmKey, p.localId));
+      left.forEach((p) => { dropOutboxPhoto(p); failDmMessage(dmKey, p.localId); });
     }
   };
   arm(4_000);
@@ -711,7 +752,7 @@ async function flushExtSends(dmKey) {
       let sent = false, lastErr = null;
       for (const chatId of candidates) {
         try {
-          const realId = await dc.sendTextMsg(dm.sereAccountId, chatId, item.text, item.replyToId);
+          const realId = await sendQueuedItem(dm.sereAccountId, chatId, item, item.replyToId);
           // CRITICAL: a send only counts as delivered if DC actually ENCRYPTED it.
           // Before the securejoin key exchange completes, DC happily creates an
           // unencrypted message (sendMsg returns an id, no error) — but chatmail
@@ -738,7 +779,7 @@ async function flushExtSends(dmKey) {
           break;
         } catch (e) { lastErr = e; }
       }
-      if (sent) { queue.shift(); continue; }
+      if (sent) { dropOutboxPhoto(queue.shift()); continue; }
 
       const emsg = String(lastErr?.message || '').toLowerCase();
       if (emsg.includes('key is missing') || emsg.includes('cannot send')) {
@@ -747,7 +788,7 @@ async function flushExtSends(dmKey) {
       }
       console.error(`[ext flush] send failed for ${dmKey}:`, lastErr?.message);
       sseBroadcast(`dm:${dmKey}`, { type: 'message_send_failed', localId: item.localId });
-      queue.shift();
+      dropOutboxPhoto(queue.shift());
     }
   } finally {
     _extFlushing.delete(dmKey);
@@ -1065,7 +1106,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
 
   try {
     const msg = await dc.getMessage(contextId, msgId);
-    if (!msg.text || msg.text === '​') return;
+    if ((!msg.text || msg.text === '​') && !(dmKey && isImage(msg))) return;
     if (msg.isInfo || DM_SYSTEM_NOISE.some((s) => (msg.text || '').toLowerCase().includes(s))) return;
 
     if (dmKey && isRecentOutgoing(contextId, msgId)) return;
@@ -1096,7 +1137,7 @@ dc.on('IncomingMsg', async (contextId, event) => {
     if (dmKey && formatted && !formatted.isSystem) {
       store.addDmMessage(dmKey, formatted);
       const lastMsg = {
-        text: formatted.text,
+        text: photoPreview(formatted.text, formatted.image),
         senderUsername: formatted.senderUsername,
         timestamp: formatted.timestamp || Math.floor(Date.now() / 1000),
       };
@@ -1260,6 +1301,7 @@ function formatDmMessage(msg, dm, viewerUsername) {
     timestamp: msg.timestamp,
     chatId: msg.chatId,
     replyTo,
+    ...(isImage(msg) ? { image: true } : {}),
     ...(msg.state === 24 ? { failed: true } : {}),
   };
 }
@@ -1283,7 +1325,7 @@ const DM_PAIR_WINDOW_S = 600; // sender copy ↔ recipient copy
 const DM_DUP_WINDOW_S = 120;  // DC message ↔ cached copy whose id doesn't match
 
 function sameSenderText(a, b) {
-  return (a.senderUsername ?? '') === (b.senderUsername ?? '') && (a.text ?? '') === (b.text ?? '');
+  return (a.senderUsername ?? '') === (b.senderUsername ?? '') && (a.text ?? '') === (b.text ?? '') && !!a.image === !!b.image;
 }
 
 const tsDiff = (a, b) => Math.abs((a.timestamp || 0) - (b.timestamp || 0));
@@ -1349,6 +1391,7 @@ function mergeDmMessages(dcMessages, cachedMessages) {
 // ── Express ──────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
+app.use(['/dm/:dm_key/send', '/dc-groups/:username/:chatId/send'], express.json({ limit: '12mb' }));
 app.use(express.json());
 
 // Timeout middleware — SSE endpoints are excluded (they stay open intentionally)
@@ -1558,7 +1601,7 @@ async function sendDcGroupItem(username, chatId, item) {
     },
   });
   try {
-    const realId = await dc.sendTextMsg(acc.accountId, chatId, item.text, quote.quotedMessageId ?? null, quote.quotedText ?? null);
+    const realId = await sendQueuedItem(acc.accountId, chatId, item, quote.quotedMessageId ?? null, quote.quotedText ?? null);
     const padlock = await dc.getMessage(acc.accountId, realId).then((m) => m?.showPadlock !== false).catch(() => true);
     if (!padlock) {
       await dc.deleteMessages(acc.accountId, [realId]).catch(() => {});
@@ -1576,6 +1619,7 @@ async function sendDcGroupItem(username, chatId, item) {
 
 function markDcGroupItemFailed(username, chatId, localId) {
   const key = dcgKey(username, chatId);
+  dropOutboxPhoto(store.getDcGroupSends(key).find((p) => p.localId === localId));
   const list = store.getDcGroupSends(key).map((p) => (p.localId === localId ? { ...p, failed: true } : p));
   const failed = list.filter((p) => p.failed).slice(-DCG_MAX_FAILED_KEPT);
   store.setDcGroupSends(key, [...list.filter((p) => !p.failed), ...failed]);
@@ -1593,7 +1637,10 @@ async function flushDcGroupSends(username, chatId) {
       const outcome = await sendDcGroupItem(username, chatId, item);
       _dcgLastOutcome.set(key, outcome);
       if (outcome === 'wait' || outcome === 'joining') break;
-      if (outcome === 'sent') store.setDcGroupSends(key, store.getDcGroupSends(key).filter((p) => p.localId !== item.localId));
+      if (outcome === 'sent') {
+        store.setDcGroupSends(key, store.getDcGroupSends(key).filter((p) => p.localId !== item.localId));
+        dropOutboxPhoto(item);
+      }
       else markDcGroupItemFailed(username, chatId, item.localId);
     }
   } finally {
@@ -1727,7 +1774,7 @@ app.get('/dc-groups/:username/:chatId/messages', async (req, res) => {
     if (!opts.before) {
       const nowSec = Math.floor(Date.now() / 1000);
       for (const p of store.getDcGroupSends(dcgKey(username, chatId))) {
-        messages.push({ id: p.localId, text: p.text, senderUsername: username, senderName: username, isSystem: false, isMine: true, image: false, timestamp: p.at || nowSec, replyTo: p.replyTo || null, failed: !!p.failed, pending: !p.failed });
+        messages.push({ id: p.localId, text: p.text, senderUsername: username, senderName: username, isSystem: false, isMine: true, image: !!p.image, timestamp: p.at || nowSec, replyTo: p.replyTo || null, failed: !!p.failed, pending: !p.failed });
       }
     }
     const full = await dc.rpc.getFullChatById(acc.accountId, chatId).catch(() => null);
@@ -1743,6 +1790,8 @@ app.get('/dc-groups/:username/:chatId/image/:msgId', async (req, res) => {
   const chatId = Number(req.params.chatId);
   const msgId = Number(req.params.msgId);
   if (!acc || !chatId || !msgId) return res.status(404).end();
+  const queued = store.getDcGroupSends(dcgKey(req.params.username, chatId)).find((p) => p.localId === msgId);
+  if (queued) return sendOutboxPhoto(res, queued);
   try {
     const msg = await dc.getMessage(acc.accountId, msgId);
     if (msg?.chatId !== chatId || !formatGroupMessage(msg, { selfAddr: '', selfUsername: '', usernameByAddr: () => null }).image) return res.status(404).end();
@@ -1816,8 +1865,10 @@ app.post('/dc-groups/:username/:chatId/send', async (req, res) => {
   const text = String(req.body?.text || '').trim();
   const acc = dcgAccount(username);
   if (!acc || !chatId) return res.status(404).json({ error: 'Group not found' });
-  if (!text) return res.status(400).json({ error: 'text required' });
+  if (!text && !req.body?.image) return res.status(400).json({ error: 'text required' });
   if (text.length > 5000) return res.status(400).json({ error: 'Message is too long.' });
+  const photo = req.body?.image ? decodeImage(req.body.image) : null;
+  if (photo?.error) return res.status(400).json({ error: photo.error });
   try {
     const chat = await dcgChat(acc.accountId, chatId);
     if (!chat) return res.status(404).json({ error: 'Group not found' });
@@ -1828,6 +1879,7 @@ app.post('/dc-groups/:username/:chatId/send', async (req, res) => {
       at: Math.floor(Date.now() / 1000),
       text,
       replyTo: r?.id || r?.text ? { id: r.id ?? null, text: String(r.text || '').slice(0, 200), senderUsername: r.senderUsername || null } : null,
+      ...(photo ? { image: saveOutboxPhoto(photo) } : {}),
     };
     const key = dcgKey(username, chatId);
     store.setDcGroupSends(key, [...store.getDcGroupSends(key), item]);
@@ -3217,8 +3269,13 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
   next();
 }, blockCheckMiddleware, rateLimiter, spamFilter, async (req, res) => {
   const { dm_key } = req.params;
-  const { sender_username, text, reply_to } = req.body;
-  if (!sender_username || !text) return res.status(400).json({ error: 'sender_username and text required' });
+  const { sender_username, reply_to } = req.body;
+  const text = typeof req.body.text === 'string' ? req.body.text : '';
+  if (!sender_username || (!text && !req.body.image)) return res.status(400).json({ error: 'sender_username and text required' });
+  const photo = req.body.image ? decodeImage(req.body.image) : null;
+  if (photo?.error) return res.status(400).json({ error: photo.error });
+  const pic = photo ? { image: true } : {};
+  const preview = photoPreview(text, !!photo);
 
   try {
     const dm = store.getDm(dm_key);
@@ -3231,14 +3288,14 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
         ? { id: reply_to.id, text: reply_to.text || '', senderUsername: reply_to.senderUsername || null }
         : null;
       const replyToId = (reply_to?.id && typeof reply_to.id === 'number') ? reply_to.id : null;
-      sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
-      store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
-      store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
+      sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
+      store.setDmLastMessage(dm_key, { text: preview, senderUsername: sender_username, timestamp: nowSec });
+      store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
       res.json({ msgId: localId });
       // Queue the message and flush it. If the securejoin key exchange isn't
       // finished yet (chatmail returns "key is missing"), it stays queued and is
       // delivered the moment the keys arrive — instead of being lost.
-      queueExtSend(dm_key, { localId, text, replyToId });
+      queueExtSend(dm_key, { localId, text, replyToId, ...(photo ? { image: saveOutboxPhoto(photo) } : {}) });
       flushExtSends(dm_key).catch(() => {});
       scheduleExtFlush(dm_key);
       return;
@@ -3255,6 +3312,7 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
 
     // Legacy bot-DM fallback
     if (dm.chatId && !dm.userAAccountId) {
+      if (photo) return res.status(400).json({ error: 'Photos are not supported in this chat.' });
       const botId = await ensureBotAccount();
       sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
       store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
@@ -3275,14 +3333,15 @@ app.post('/dm/:dm_key/send', (req, res, next) => {
     const senderInfo = store.getDmAccountAndChat(dm_key, sender_username);
     if (!senderInfo) return res.status(500).json({ error: 'Sender account not found' });
 
-    sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
-    store.setDmLastMessage(dm_key, { text, senderUsername: sender_username, timestamp: nowSec });
-    store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo });
+    sseBroadcast(`dm:${dm_key}`, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
+    store.setDmLastMessage(dm_key, { text: preview, senderUsername: sender_username, timestamp: nowSec });
+    store.addDmMessage(dm_key, { id: localId, text, senderUsername: sender_username, isSystem: false, timestamp: nowSec, replyTo, ...pic });
     res.json({ msgId: localId });
 
     queueUserSend(dm_key, {
       localId,
       text,
+      ...(photo ? { image: saveOutboxPhoto(photo) } : {}),
       sender: sender_username,
       replyTo: reply_to?.id || reply_to?.text ? { id: reply_to.id ?? null, text: reply_to.text || '' } : null,
     });
@@ -3313,8 +3372,8 @@ async function loadDmPage(accountId, chatIds, dmKey, dm, viewerUser, opts) {
 
   const merged = hideUndelivered(mergeDmMessages(messages, store.getDmCachedMessages(dmKey)), viewerUser);
   if (!dm.lastMessage) {
-    const last = [...merged].reverse().find((m) => m.text && !m.isSystem);
-    if (last) store.setDmLastMessage(dmKey, { text: last.text, senderUsername: last.senderUsername, timestamp: last.timestamp });
+    const last = [...merged].reverse().find((m) => (m.text || m.image) && !m.isSystem);
+    if (last) store.setDmLastMessage(dmKey, { text: photoPreview(last.text, last.image), senderUsername: last.senderUsername, timestamp: last.timestamp });
   }
   if (!hasMore) return { messages: merged, hasMore, nextBefore };
 
@@ -3416,6 +3475,47 @@ app.get('/dm/:dm_key/messages', async (req, res) => {
   } catch (e) {
     console.error('[/dm/:key/messages]', e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /dm/:dm_key/image/:msgId?username= ──────────────────────────────
+// A photo from this DM, read from the viewer's own account.
+app.get('/dm/:dm_key/image/:msgId', async (req, res) => {
+  const { dm_key } = req.params;
+  const { username } = req.query;
+  const msgId = Number(req.params.msgId);
+  const dm = store.getDm(dm_key);
+  if (!dm || !msgId || !username) return res.status(404).end();
+  const queued = [...pendingUserSends(dm_key), ...(_extPendingSends.get(dm_key) || [])].find((p) => p.localId === msgId);
+  if (queued) return (dm.dcExternal || queued.sender === username) ? sendOutboxPhoto(res, queued) : res.status(404).end();
+
+  let accountId, chatIds, otherAddr;
+  if (dm.dcExternal) {
+    if (username !== dm.sereUser) return res.status(404).end();
+    accountId = dm.sereAccountId;
+    chatIds = [dm.chatId, ...(dm.chatIds || [])];
+    otherAddr = dm.extAddr;
+  } else if (username === dm.userA || username === dm.userB) {
+    const isA = username === dm.userA;
+    accountId = isA ? dm.userAAccountId : dm.userBAccountId;
+    chatIds = [isA ? dm.userAChatId : dm.userBChatId, ...((isA ? dm.userAChatIds : dm.userBChatIds) || [])];
+    otherAddr = store.getAccount(isA ? dm.userB : dm.userA)?.addr;
+  }
+  if (!accountId) return res.status(404).end();
+  try {
+    const msg = await dc.getMessage(accountId, msgId);
+    if (!isImage(msg)) return res.status(404).end();
+    let inDm = chatIds.includes(msg.chatId);
+    if (!inDm && otherAddr) {
+      const contactId = await dc.lookupContactIdByAddr(accountId, otherAddr).catch(() => 0);
+      inDm = !!contactId && (await dc.createChatByContactId(accountId, contactId).catch(() => 0)) === msg.chatId;
+    }
+    if (!inDm) return res.status(404).end();
+    res.setHeader('Content-Type', msg.fileMime || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
+  } catch {
+    res.status(404).end();
   }
 });
 

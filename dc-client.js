@@ -104,8 +104,9 @@ export class DeltaChatClient extends EventEmitter {
 
   // ── Messages ─────────────────────────────────────────────────────
 
-  sendTextMsg(accountId, chatId, text, quotedMsgId = null, quotedText = null) {
+  sendTextMsg(accountId, chatId, text, quotedMsgId = null, quotedText = null, file = null) {
     const msg = { text };
+    if (file) Object.assign(msg, { file, filename: `photo.${file.split('.').pop()}`, viewtype: 'Image' });
     if (quotedMsgId && typeof quotedMsgId === 'number') msg.quotedMessageId = quotedMsgId;
     else if (quotedText) msg.quotedText = quotedText;
     return this._dc.rpc.sendMsg(accountId, chatId, msg);
