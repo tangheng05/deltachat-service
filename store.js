@@ -47,6 +47,8 @@ export class Store {
         this.data.accounts ??= {};
         this.data.orderChats ??= {};
         this.data.communityGroups ??= {};
+        this.data.dcGroupSends ??= {};
+        this.data.dcGroupJoins ??= {};
         this.data.directMessages ??= {};
         this.data.moderation ??= { blocks: {}, globalMutes: {}, mutedDms: {} };
         this.data.moderation.blocks ??= {};
@@ -94,6 +96,32 @@ export class Store {
 
   getAccount(username) { return this.data.accounts[username] ?? null; }
   getAllAccounts() { return this.data.accounts; }
+
+  // Delta Chat groups: waiting sends and pending joins (the groups themselves live in DC).
+  getDcGroupSends(key) { return this.data.dcGroupSends?.[key] || []; }
+
+  setDcGroupSends(key, list) {
+    this.data.dcGroupSends ??= {};
+    if (list.length) this.data.dcGroupSends[key] = list;
+    else delete this.data.dcGroupSends[key];
+    this._save();
+  }
+
+  getDcGroupJoin(username, chatId) { return this.data.dcGroupJoins?.[`${username}:${chatId}`] || null; }
+
+  setDcGroupJoin(username, chatId, info) {
+    this.data.dcGroupJoins ??= {};
+    if (info) this.data.dcGroupJoins[`${username}:${chatId}`] = info;
+    else delete this.data.dcGroupJoins[`${username}:${chatId}`];
+    this._save();
+  }
+
+  dcGroupJoinsFor(username) {
+    const prefix = `${username}:`;
+    return Object.entries(this.data.dcGroupJoins || {})
+      .filter(([k]) => k.startsWith(prefix))
+      .map(([k, v]) => ({ chatId: Number(k.slice(prefix.length)), ...v }));
+  }
 
   // Presence stamp for the drain plan. Hourly, so polls don't rewrite the store.
   touchAccount(username, at = Date.now()) {

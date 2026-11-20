@@ -61,3 +61,21 @@ test('quote of own message is attributed to the user', () => {
 test('a failed own message is marked failed', () => {
   assert.strictEqual(formatGroupMessage(msg({ state: 24 }), ctx).failed, true);
 });
+
+test('dc group send queue survives a reload', async () => {
+  const { Store } = await import('../store.js');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const file = join(tmpdir(), `dcg-queue-${process.pid}.json`);
+  const a = new Store(file);
+  a.setDcGroupSends('dcg:boss:13', [{ localId: 1, text: 'hi' }]);
+  a.setDcGroupJoin('boss', 13, { pending: true, inviterContactId: 10, at: 5 });
+  a.flush();
+  const b = new Store(file);
+  assert.deepStrictEqual(b.getDcGroupSends('dcg:boss:13'), [{ localId: 1, text: 'hi' }]);
+  assert.deepStrictEqual(b.getDcGroupJoin('boss', 13), { pending: true, inviterContactId: 10, at: 5 });
+  b.setDcGroupSends('dcg:boss:13', []);
+  assert.deepStrictEqual(b.getDcGroupSends('dcg:boss:13'), []);
+  assert.strictEqual(b.data.dcGroupSends['dcg:boss:13'], undefined);
+  clearTimeout(a._saveTimer); clearTimeout(b._saveTimer);
+});

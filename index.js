@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { createReadStream, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
 import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
+import { groupState, formatGroupMessage, isShownMessage } from './dc-groups.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -604,7 +605,14 @@ function scheduleUserFlush(dmKey) {
 // The mail server or DC refused a message after it was handed over.
 dc.on('MsgFailed', (contextId, e) => {
   const dmKey = store.findDmKeyByChatId(e.chatId, contextId);
-  if (!dmKey) return;
+  if (!dmKey) {
+    routeDcGroupEvent(contextId, e.chatId, 0).then((isGroup) => {
+      if (!isGroup) return;
+      const username = store.findUsernameByAccountId(contextId);
+      if (username) sseBroadcast(`dcgroup:${username}:${e.chatId}`, { type: 'message_send_failed', localId: e.msgId });
+    }).catch(() => {});
+    return;
+  }
   console.warn(`[dm send] delivery failed for ${dmKey} (account ${contextId}, msg ${e.msgId})`);
   failDmMessage(dmKey, e.msgId);
 });
@@ -940,6 +948,9 @@ dc.on('IncomingMsg', async (contextId, event) => {
   // Pass contextId so chatId numbers from different accounts don't collide
   let   dmKey       = (!orderId && !communityId) ? store.findDmKeyByChatId(chatId, contextId) : null;
 
+  // A Delta Chat group in a user's own account: never treat it as a DM.
+  if (!orderId && !communityId && !dmKey && await routeDcGroupEvent(contextId, chatId, msgId).catch(() => false)) return;
+
   // Handle inbound from DC mobile — chatId not yet in store, or landed in a
   // contact-request chat with a new chatId (different from the provisioned one).
   if (!orderId && !communityId && !dmKey) {
@@ -1161,10 +1172,16 @@ dc.on('MsgDeleted', (contextId, event) => {
 dc.on('MsgsChanged', async (contextId, event) => {
   try {
     const { chatId, msgId } = event;
-    if (!msgId) return;
+    if (!msgId) {
+      if (contextId !== botAccountId && chatId) dcgRefreshSoon(contextId, chatId);
+      return;
+    }
 
     const dmKey = store.findDmKeyByChatId(chatId, contextId);
-    if (!dmKey) return;
+    if (!dmKey) {
+      if (contextId !== botAccountId && chatId) dcgRefreshSoon(contextId, chatId);
+      return;
+    }
 
     const msg = await dc.getMessage(contextId, msgId).catch(() => null);
     if (!msg?.isEdited) return;
@@ -1424,6 +1441,358 @@ app.delete('/accounts/:username/device-login', async (req, res) => {
   if (!info?.accountId) return res.status(404).json({ error: 'Account not found' });
   await deviceLogins.cancel(info.accountId);
   res.json({ ok: true });
+});
+
+// ── Delta Chat groups ────────────────────────────────────────────────
+// Groups made in the Delta Chat app, joined with the user's own DC account.
+// The account is the source of truth: a DC group is any Group chat in a
+// per-user account (Serey's own groups live in the bot account).
+const JOIN_PENDING_MAX_MS = 7 * 24 * 3600_000;
+const DCG_SEND_ATTEMPTS = Number(process.env.DM_SEND_ATTEMPTS) || 14;
+const DCG_MAX_FAILED_KEPT = 50;
+const _dcgFlushing = new Map();
+const _dcgRetryTimers = new Map();
+
+const dcgKey = (username, chatId) => `dcg:${username}:${chatId}`;
+
+function dcgAccount(username) {
+  if (!username || username === '__bot__' || !USERNAME_RE.test(username)) return null;
+  const info = store.getAccount(username);
+  return info?.accountId && info.accountId !== botAccountId ? info : null;
+}
+
+function usernameByAddrMap() {
+  const map = new Map();
+  for (const [u, a] of Object.entries(store.getAllAccounts())) if (u !== '__bot__' && a?.addr) map.set(a.addr, u);
+  return (addr) => map.get(addr) || null;
+}
+
+function isJoinPending(username, chatId) {
+  const rec = store.getDcGroupJoin(username, chatId);
+  return !!rec?.pending && Date.now() - (rec.at || 0) < JOIN_PENDING_MAX_MS;
+}
+
+async function dcgChat(accountId, chatId) {
+  const item = (await dc.rpc.getChatlistItemsByEntries(accountId, [chatId]))?.[chatId];
+  return item?.kind === 'ChatListItem' && item.chatType === 'Group' ? item : null;
+}
+
+const dcgState = (username, item) =>
+  groupState({ canSend: item.isSelfInGroup, joinPending: isJoinPending(username, item.id) });
+
+function dcgNotify(username, chatId, payload) {
+  if (payload) sseBroadcast(`dcgroup:${username}:${chatId}`, payload);
+  sseBroadcast(`user:${username}`, { type: 'dc_group_updated', chatId });
+}
+
+// Live updates from a user account's group chat. Returns true when handled.
+async function routeDcGroupEvent(contextId, chatId, msgId) {
+  if (!chatId || contextId === botAccountId) return false;
+  const info = await dc.rpc.getBasicChatInfo(contextId, chatId).catch(() => null);
+  if (info?.chatType !== 'Group') return false;
+  const username = store.findUsernameByAccountId(contextId);
+  if (!username) return true;
+  let payload = { type: 'refresh' };
+  if (msgId) {
+    const msg = await dc.getMessage(contextId, msgId).catch(() => null);
+    if (msg && isShownMessage(msg)) {
+      payload = formatGroupMessage(msg, { selfAddr: store.getAccount(username)?.addr, selfUsername: username, usernameByAddr: usernameByAddrMap() });
+    }
+  }
+  dcgNotify(username, chatId, payload);
+  return true;
+}
+
+// Sends wait here until the chat is joined, encrypted and sendable.
+// 'sent' | 'wait' | 'failed'
+async function sendDcGroupItem(username, chatId, item) {
+  const acc = dcgAccount(username);
+  if (!acc) return 'failed';
+  const chat = await dcgChat(acc.accountId, chatId).catch(() => null);
+  if (!chat) return 'failed';
+  const state = dcgState(username, chat);
+  if (state === 'removed') return 'failed';
+  if (state === 'joining' || !chat.isEncrypted) return 'wait';
+
+  await dc.rpc.startIo(acc.accountId).catch(() => {});
+  ioSendLinger(acc.accountId);
+  const quote = await resolveQuote(item.replyTo, {
+    chatIds: [chatId],
+    getMessage: (id) => dc.getMessage(acc.accountId, id),
+    recentMessages: async () => {
+      const ids = (await dc.getMessageIds(acc.accountId, chatId)).slice(-200).reverse();
+      return (await loadMessagesById(acc.accountId, ids)).filter(Boolean);
+    },
+  });
+  try {
+    const realId = await dc.sendTextMsg(acc.accountId, chatId, item.text, quote.quotedMessageId ?? null, quote.quotedText ?? null);
+    const padlock = await dc.getMessage(acc.accountId, realId).then((m) => m?.showPadlock !== false).catch(() => true);
+    if (!padlock) {
+      await dc.deleteMessages(acc.accountId, [realId]).catch(() => {});
+      return 'wait';
+    }
+    sseBroadcast(`dcgroup:${username}:${chatId}`, { type: 'message_id_updated', localId: item.localId, realId });
+    return 'sent';
+  } catch (e) {
+    const emsg = String(e.message || '').toLowerCase();
+    if (emsg.includes('key is missing') || emsg.includes('cannot send')) return 'wait';
+    console.error(`[dc-groups] send ${username}/${chatId}:`, e.message);
+    return 'failed';
+  }
+}
+
+function markDcGroupItemFailed(username, chatId, localId) {
+  const key = dcgKey(username, chatId);
+  const list = store.getDcGroupSends(key).map((p) => (p.localId === localId ? { ...p, failed: true } : p));
+  const failed = list.filter((p) => p.failed).slice(-DCG_MAX_FAILED_KEPT);
+  store.setDcGroupSends(key, [...list.filter((p) => !p.failed), ...failed]);
+  sseBroadcast(`dcgroup:${username}:${chatId}`, { type: 'message_send_failed', localId });
+}
+
+async function flushDcGroupSends(username, chatId) {
+  const key = dcgKey(username, chatId);
+  if (_dcgFlushing.get(key)) return;
+  _dcgFlushing.set(key, true);
+  try {
+    for (;;) {
+      const item = store.getDcGroupSends(key).find((p) => !p.failed);
+      if (!item) break;
+      const outcome = await sendDcGroupItem(username, chatId, item);
+      if (outcome === 'wait') break;
+      if (outcome === 'sent') store.setDcGroupSends(key, store.getDcGroupSends(key).filter((p) => p.localId !== item.localId));
+      else markDcGroupItemFailed(username, chatId, item.localId);
+    }
+  } finally {
+    _dcgFlushing.delete(key);
+  }
+}
+
+function scheduleDcGroupFlush(username, chatId) {
+  const key = dcgKey(username, chatId);
+  if (_dcgRetryTimers.has(key)) return;
+  let attempt = 0;
+  const arm = (delay) => {
+    const t = setTimeout(tick, delay);
+    t.unref?.();
+    _dcgRetryTimers.set(key, t);
+  };
+  const tick = async () => {
+    await flushDcGroupSends(username, chatId).catch(() => {});
+    const left = store.getDcGroupSends(key).filter((p) => !p.failed);
+    if (left.length && attempt < DCG_SEND_ATTEMPTS) return arm(Math.min(4_000 * 1.4 ** attempt++, 30_000));
+    _dcgRetryTimers.delete(key);
+    if (left.length) {
+      console.warn(`[dc-groups] gave up on ${left.length} message(s) for ${username}/${chatId}`);
+      left.forEach((p) => markDcGroupItemFailed(username, chatId, p.localId));
+    }
+  };
+  arm(4_000);
+}
+
+dc.on('SecurejoinJoinerProgress', (contextId, e) => {
+  if (e.progress !== 1000 || contextId === botAccountId) return;
+  const username = store.findUsernameByAccountId(contextId);
+  if (!username) return;
+  for (const join of store.dcGroupJoinsFor(username)) {
+    if (!join.pending || join.inviterContactId !== e.contactId) continue;
+    store.setDcGroupJoin(username, join.chatId, { ...join, pending: false });
+    console.log(`[dc-groups] ${username} joined group chat ${join.chatId}`);
+    dcgNotify(username, join.chatId, { type: 'refresh' });
+    flushDcGroupSends(username, join.chatId).catch(() => {});
+  }
+});
+
+// MsgsChanged fires in bursts; one refresh per group per second is enough.
+const _dcgRefreshTimers = new Map();
+function dcgRefreshSoon(contextId, chatId) {
+  const key = `${contextId}:${chatId}`;
+  if (_dcgRefreshTimers.has(key)) return;
+  const t = setTimeout(() => {
+    _dcgRefreshTimers.delete(key);
+    routeDcGroupEvent(contextId, chatId, 0).catch(() => {});
+  }, 1_000);
+  t.unref?.();
+  _dcgRefreshTimers.set(key, t);
+}
+
+dc.on('ChatModified', (contextId, e) => dcgRefreshSoon(contextId, e.chatId));
+
+app.post('/dc-groups/:username/join', async (req, res) => {
+  const { username } = req.params;
+  const invite = String(req.body?.invite || '').trim();
+  const acc = dcgAccount(username);
+  if (!acc) return res.status(404).json({ error: 'Account not found' });
+  if (!invite || invite.length > 2000) return res.status(400).json({ error: 'Paste a Delta Chat group invite link.' });
+  try {
+    const qr = await withTimeout(dc.rpc.checkQr(acc.accountId, invite), 10_000, 'dcg/checkQr').catch(() => null);
+    if (qr?.kind !== 'askVerifyGroup') return res.status(400).json({ error: 'That is not a Delta Chat group invite.' });
+    await dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId, QR_IO_LINGER_MS);
+    const before = new Set(await dc.rpc.getChatlistEntries(acc.accountId, null, null, null).catch(() => []));
+    const chatId = await withTimeout(dc.rpc.secureJoin(acc.accountId, invite), 30_000, 'dcg/secureJoin');
+    const chat = await dcgChat(acc.accountId, chatId);
+    const alreadyIn = before.has(chatId) && chat?.isSelfInGroup && !isJoinPending(username, chatId);
+    if (!alreadyIn) store.setDcGroupJoin(username, chatId, { pending: true, inviterContactId: qr.contact_id, at: Date.now() });
+    console.log(`[dc-groups] ${username} ${alreadyIn ? 'reopened' : 'joining'} group chat ${chatId}`);
+    dcgNotify(username, chatId, null);
+    res.json({ chatId, name: chat?.name || qr.grpname || '', state: alreadyIn ? 'active' : 'joining' });
+  } catch (e) {
+    console.error('[dc-groups] join', username, e.message);
+    res.status(500).json({ error: 'Could not join the group. Try again.' });
+  }
+});
+
+app.get('/dc-groups/:username', async (req, res) => {
+  const { username } = req.params;
+  const acc = dcgAccount(username);
+  if (!acc) return res.json({ groups: [] });
+  try {
+    dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId);
+    const entries = await withTimeout(dc.rpc.getChatlistEntries(acc.accountId, null, null, null), 8_000, 'dcg/list');
+    const items = Object.values(await withTimeout(dc.rpc.getChatlistItemsByEntries(acc.accountId, entries), 8_000, 'dcg/items'))
+      .filter((it) => it.kind === 'ChatListItem' && it.chatType === 'Group');
+    const groups = await Promise.all(items.map(async (it) => {
+      const last = it.lastMessageId ? await dc.getMessage(acc.accountId, it.lastMessageId).catch(() => null) : null;
+      const lastMessage = last && isShownMessage(last)
+        ? { text: last.text || (last.viewType ? 'Photo' : ''), senderName: last.isInfo ? null : last.sender?.displayName || null, timestamp: last.timestamp }
+        : null;
+      return { chatId: it.id, name: it.name, state: dcgState(username, it), unread: it.freshMessageCounter || 0, lastMessage, lastUpdated: it.lastUpdated || 0 };
+    }));
+    groups.sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+    res.json({ groups });
+  } catch (e) {
+    console.error('[dc-groups] list', username, e.message);
+    res.status(503).json({ error: 'Chat service busy, retry' });
+  }
+});
+
+app.get('/dc-groups/:username/:chatId/messages', async (req, res) => {
+  const { username } = req.params;
+  const chatId = Number(req.params.chatId);
+  const acc = dcgAccount(username);
+  if (!acc || !chatId) return res.status(404).json({ error: 'Group not found' });
+  try {
+    const chat = await dcgChat(acc.accountId, chatId);
+    if (!chat) return res.status(404).json({ error: 'Group not found' });
+    dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId);
+    const opts = pageOpts(req.query);
+    const ids = await withTimeout(dc.getMessageIds(acc.accountId, chatId), 8_000, 'dcg/ids');
+    const { page, hasMore, nextBefore } = pageIds(ids, opts);
+    const ctx = { selfAddr: acc.addr, selfUsername: username, usernameByAddr: usernameByAddrMap() };
+    const messages = chronological((await loadMessagesById(acc.accountId, page))
+      .filter((m) => m && isShownMessage(m))
+      .map((m) => formatGroupMessage(m, ctx)));
+    if (!opts.before) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      for (const p of store.getDcGroupSends(dcgKey(username, chatId))) {
+        messages.push({ id: p.localId, text: p.text, senderUsername: username, senderName: username, isSystem: false, isMine: true, image: false, timestamp: p.at || nowSec, replyTo: p.replyTo || null, failed: !!p.failed, pending: !p.failed });
+      }
+    }
+    res.json({ messages, hasMore, nextBefore, name: chat.name, state: dcgState(username, chat) });
+  } catch (e) {
+    console.error('[dc-groups] messages', username, chatId, e.message);
+    res.status(503).json({ error: 'Chat service busy, retry' });
+  }
+});
+
+app.get('/dc-groups/:username/:chatId/image/:msgId', async (req, res) => {
+  const acc = dcgAccount(req.params.username);
+  const chatId = Number(req.params.chatId);
+  const msgId = Number(req.params.msgId);
+  if (!acc || !chatId || !msgId) return res.status(404).end();
+  try {
+    const msg = await dc.getMessage(acc.accountId, msgId);
+    if (msg?.chatId !== chatId || !formatGroupMessage(msg, { selfAddr: '', selfUsername: '', usernameByAddr: () => null }).image) return res.status(404).end();
+    if (!(await dcgChat(acc.accountId, chatId))) return res.status(404).end();
+    res.setHeader('Content-Type', msg.fileMime || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    createReadStream(msg.file).on('error', () => res.destroy()).pipe(res);
+  } catch {
+    res.status(404).end();
+  }
+});
+
+app.post('/dc-groups/:username/:chatId/send', async (req, res) => {
+  const { username } = req.params;
+  const chatId = Number(req.params.chatId);
+  const text = String(req.body?.text || '').trim();
+  const acc = dcgAccount(username);
+  if (!acc || !chatId) return res.status(404).json({ error: 'Group not found' });
+  if (!text) return res.status(400).json({ error: 'text required' });
+  if (text.length > 5000) return res.status(400).json({ error: 'Message is too long.' });
+  try {
+    const chat = await dcgChat(acc.accountId, chatId);
+    if (!chat) return res.status(404).json({ error: 'Group not found' });
+    if (dcgState(username, chat) === 'removed') return res.status(403).json({ error: 'You were removed from this group.' });
+    const r = req.body?.reply_to;
+    const item = {
+      localId: Date.now(),
+      at: Math.floor(Date.now() / 1000),
+      text,
+      replyTo: r?.id || r?.text ? { id: r.id ?? null, text: String(r.text || '').slice(0, 200), senderUsername: r.senderUsername || null } : null,
+    };
+    const key = dcgKey(username, chatId);
+    store.setDcGroupSends(key, [...store.getDcGroupSends(key), item]);
+    res.json({ msgId: item.localId });
+    flushDcGroupSends(username, chatId).catch(() => {});
+    scheduleDcGroupFlush(username, chatId);
+  } catch (e) {
+    console.error('[dc-groups] send', username, chatId, e.message);
+    if (!res.headersSent) res.status(503).json({ error: 'Chat service busy, retry' });
+  }
+});
+
+app.post('/dc-groups/:username/:chatId/seen', async (req, res) => {
+  const acc = dcgAccount(req.params.username);
+  const chatId = Number(req.params.chatId);
+  if (!acc || !chatId || !(await dcgChat(acc.accountId, chatId).catch(() => null))) return res.status(404).json({ error: 'Group not found' });
+  await dc.rpc.marknoticedChat(acc.accountId, chatId).catch(() => {});
+  sseBroadcast(`user:${req.params.username}`, { type: 'dc_group_updated', chatId });
+  res.json({ ok: true });
+});
+
+app.post('/dc-groups/:username/:chatId/leave', async (req, res) => {
+  const { username } = req.params;
+  const acc = dcgAccount(username);
+  const chatId = Number(req.params.chatId);
+  if (!acc || !chatId || !(await dcgChat(acc.accountId, chatId).catch(() => null))) return res.status(404).json({ error: 'Group not found' });
+  try {
+    await dc.rpc.startIo(acc.accountId).catch(() => {});
+    ioSendLinger(acc.accountId);
+    await withTimeout(dc.rpc.leaveGroup(acc.accountId, chatId), 15_000, 'dcg/leave');
+    store.setDcGroupJoin(username, chatId, null);
+    store.setDcGroupSends(dcgKey(username, chatId), []);
+    dcgNotify(username, chatId, { type: 'refresh' });
+    console.log(`[dc-groups] ${username} left group chat ${chatId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[dc-groups] leave', username, chatId, e.message);
+    res.status(500).json({ error: 'Could not leave the group. Try again.' });
+  }
+});
+
+app.get('/dc-groups/:username/:chatId/events', (req, res) => {
+  const { username } = req.params;
+  const chatId = Number(req.params.chatId);
+  const acc = dcgAccount(username);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write('data: {"type":"connected"}\n\n');
+  const chatKey = `dcgroup:${username}:${chatId}`;
+  sseRegister(chatKey, res);
+  if (acc) ioAcquire(acc.accountId);
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch { clearInterval(heartbeat); }
+  }, 15_000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseUnregister(chatKey, res);
+    if (acc) ioRelease(acc.accountId);
+  });
 });
 
 // ── GET /accounts/:username/key ───────────────────────────────────────
@@ -3326,6 +3695,10 @@ async function start() {
   startAllUserIo(); // keeps bot IO alive; per-user IO managed by ioAcquire/ioRelease
   for (const [dmKey, dm] of Object.entries(store.data.directMessages)) {
     if (dm.pendingSends?.length) scheduleUserFlush(dmKey);
+  }
+  for (const [key, list] of Object.entries(store.data.dcGroupSends || {})) {
+    const [, username, chatId] = key.split(':');
+    if (list.some((p) => !p.failed)) scheduleDcGroupFlush(username, Number(chatId));
   }
   setInterval(() => { dc.rpc.maybeNetwork().catch(() => {}); }, 15_000).unref();
   setInterval(startAllUserIo, 30_000).unref(); // bot keepalive only

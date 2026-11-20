@@ -28,7 +28,7 @@ export class DeltaChatClient extends EventEmitter {
       this.emit('MsgsChanged', contextId, event);
     });
 
-    for (const kind of ['SecurejoinInviterProgress', 'SecurejoinJoinerProgress', 'MsgFailed', 'ImexProgress']) {
+    for (const kind of ['SecurejoinInviterProgress', 'SecurejoinJoinerProgress', 'MsgFailed', 'ImexProgress', 'ChatModified']) {
       this._dc.on(kind, (contextId, event) => this.emit(kind, contextId, event));
     }
 
