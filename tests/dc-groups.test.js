@@ -88,3 +88,17 @@ test('a join counts as done once anyone else has written in the group', async ()
   assert.strictEqual(joinConfirmed([{ fromId: 12 }]), true);
   assert.strictEqual(joinConfirmed([]), false);
 });
+
+test('a left group is hidden until it is joined again', async () => {
+  const { Store } = await import('../store.js');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const s = new Store(join(tmpdir(), `dcg-hide-${process.pid}.json`));
+  assert.strictEqual(s.isDcGroupHidden('boss', 17), false);
+  s.hideDcGroup('boss', 17);
+  assert.strictEqual(s.isDcGroupHidden('boss', 17), true);
+  assert.strictEqual(s.isDcGroupHidden('dara', 17), false);
+  s.setDcGroupJoin('boss', 17, { pending: true, inviterContactId: 10, at: 1 });
+  assert.strictEqual(s.isDcGroupHidden('boss', 17), false);
+  clearTimeout(s._saveTimer);
+});

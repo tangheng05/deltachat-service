@@ -1506,6 +1506,11 @@ async function routeDcGroupEvent(contextId, chatId, msgId) {
   const username = store.findUsernameByAccountId(contextId);
   if (!username) return true;
   await settleJoin(username, contextId, chatId).catch(() => {});
+  if (store.isDcGroupHidden(username, chatId)) {
+    const item = await dcgChat(contextId, chatId).catch(() => null);
+    if (!item?.isSelfInGroup) return true;
+    store.setDcGroupJoin(username, chatId, null);
+  }
   let payload = { type: 'refresh' };
   if (msgId) {
     const msg = await dc.getMessage(contextId, msgId).catch(() => null);
@@ -1674,7 +1679,7 @@ app.get('/dc-groups/:username', async (req, res) => {
     ioSendLinger(acc.accountId);
     const entries = await withTimeout(dc.rpc.getChatlistEntries(acc.accountId, null, null, null), 8_000, 'dcg/list');
     let items = Object.values(await withTimeout(dc.rpc.getChatlistItemsByEntries(acc.accountId, entries), 8_000, 'dcg/items'))
-      .filter((it) => it.kind === 'ChatListItem' && it.chatType === 'Group');
+      .filter((it) => it.kind === 'ChatListItem' && it.chatType === 'Group' && !store.isDcGroupHidden(username, it.id));
     for (const it of items) if (isJoinPending(username, it.id)) await settleJoin(username, acc.accountId, it.id).catch(() => {});
     const groups = await Promise.all(items.map(async (it) => {
       const last = it.lastMessageId ? await dc.getMessage(acc.accountId, it.lastMessageId).catch(() => null) : null;
@@ -1786,8 +1791,10 @@ app.post('/dc-groups/:username/:chatId/leave', async (req, res) => {
   try {
     await dc.rpc.startIo(acc.accountId).catch(() => {});
     ioSendLinger(acc.accountId);
-    await withTimeout(dc.rpc.leaveGroup(acc.accountId, chatId), 15_000, 'dcg/leave');
-    store.setDcGroupJoin(username, chatId, null);
+    const chat = await dcgChat(acc.accountId, chatId);
+    // Already removed by the owner: nothing to announce, just take it off the list.
+    if (chat?.isSelfInGroup) await withTimeout(dc.rpc.leaveGroup(acc.accountId, chatId), 15_000, 'dcg/leave');
+    store.hideDcGroup(username, chatId);
     store.setDcGroupSends(dcgKey(username, chatId), []);
     dcgNotify(username, chatId, { type: 'refresh' });
     console.log(`[dc-groups] ${username} left group chat ${chatId}`);

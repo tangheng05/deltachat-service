@@ -116,6 +116,11 @@ export class Store {
     this._save();
   }
 
+  // Left by the user: kept in DC (history), hidden from their list until rejoined.
+  hideDcGroup(username, chatId) { this.setDcGroupJoin(username, chatId, { hidden: true, at: Date.now() }); }
+
+  isDcGroupHidden(username, chatId) { return !!this.getDcGroupJoin(username, chatId)?.hidden; }
+
   dcGroupJoinsFor(username) {
     const prefix = `${username}:`;
     return Object.entries(this.data.dcGroupJoins || {})
