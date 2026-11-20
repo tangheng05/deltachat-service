@@ -28,3 +28,7 @@ export function formatGroupMessage(msg, { selfAddr, selfUsername, usernameByAddr
     failed: msg.state === 24,
   };
 }
+
+// DC contact ids up to 9 are special (1 = self, 2 = info). A message from any
+// real contact means the owner has let us in, even if the join event was missed.
+export const joinConfirmed = (messages) => messages.some((m) => (m?.fromId || 0) > 9);

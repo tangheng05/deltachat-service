@@ -79,3 +79,12 @@ test('dc group send queue survives a reload', async () => {
   assert.strictEqual(b.data.dcGroupSends['dcg:boss:13'], undefined);
   clearTimeout(a._saveTimer); clearTimeout(b._saveTimer);
 });
+
+test('a join counts as done once anyone else has written in the group', async () => {
+  const { joinConfirmed } = await import('../dc-groups.js');
+  // DC ids: 1 = me, 2 = engine info lines ("X invited you…"), 10+ = real contacts.
+  assert.strictEqual(joinConfirmed([{ fromId: 2 }, { fromId: 1 }]), false);
+  assert.strictEqual(joinConfirmed([{ fromId: 2 }, { fromId: 11, isInfo: true }]), true); // "Member Me added by X."
+  assert.strictEqual(joinConfirmed([{ fromId: 12 }]), true);
+  assert.strictEqual(joinConfirmed([]), false);
+});

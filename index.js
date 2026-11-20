@@ -12,7 +12,7 @@ import { Store } from './store.js';
 import { planDrain, DRAIN_INTERVAL_MS } from './drain-plan.js';
 import { DeviceLogins } from './device-login.js';
 import { isRealMessage, lastRealMessage, sellerInbox } from './shop-chat.js';
-import { groupState, formatGroupMessage, isShownMessage } from './dc-groups.js';
+import { groupState, formatGroupMessage, isShownMessage, joinConfirmed } from './dc-groups.js';
 import { quoteToReply, pickEncryptedChat, resolveQuote, unlinkMismatchedQuotes, hideUndelivered } from './dm-send.js';
 import { createRateLimiter } from './middleware/rateLimiter.js';
 import { spamFilter } from './middleware/spamFilter.js';
@@ -1452,6 +1452,7 @@ const DCG_SEND_ATTEMPTS = Number(process.env.DM_SEND_ATTEMPTS) || 14;
 const DCG_MAX_FAILED_KEPT = 50;
 const _dcgFlushing = new Map();
 const _dcgRetryTimers = new Map();
+const _dcgLastOutcome = new Map(); // key → last send outcome, so a join in progress never counts as a failure
 
 const dcgKey = (username, chatId) => `dcg:${username}:${chatId}`;
 
@@ -1470,6 +1471,18 @@ function usernameByAddrMap() {
 function isJoinPending(username, chatId) {
   const rec = store.getDcGroupJoin(username, chatId);
   return !!rec?.pending && Date.now() - (rec.at || 0) < JOIN_PENDING_MAX_MS;
+}
+
+// The join event can be missed (restart mid-join), so a pending join is also
+// settled by reading the group: any message from another member proves we are in.
+async function settleJoin(username, accountId, chatId) {
+  if (!isJoinPending(username, chatId)) return;
+  const ids = (await dc.getMessageIds(accountId, chatId).catch(() => [])).slice(-20);
+  const msgs = (await loadMessagesById(accountId, ids).catch(() => [])).filter(Boolean);
+  if (!joinConfirmed(msgs)) return;
+  store.setDcGroupJoin(username, chatId, { ...store.getDcGroupJoin(username, chatId), pending: false });
+  console.log(`[dc-groups] ${username} join of chat ${chatId} confirmed from messages`);
+  flushDcGroupSends(username, chatId).catch(() => {});
 }
 
 async function dcgChat(accountId, chatId) {
@@ -1492,6 +1505,7 @@ async function routeDcGroupEvent(contextId, chatId, msgId) {
   if (info?.chatType !== 'Group') return false;
   const username = store.findUsernameByAccountId(contextId);
   if (!username) return true;
+  await settleJoin(username, contextId, chatId).catch(() => {});
   let payload = { type: 'refresh' };
   if (msgId) {
     const msg = await dc.getMessage(contextId, msgId).catch(() => null);
@@ -1508,11 +1522,15 @@ async function routeDcGroupEvent(contextId, chatId, msgId) {
 async function sendDcGroupItem(username, chatId, item) {
   const acc = dcgAccount(username);
   if (!acc) return 'failed';
+  await settleJoin(username, acc.accountId, chatId).catch(() => {});
   const chat = await dcgChat(acc.accountId, chatId).catch(() => null);
   if (!chat) return 'failed';
   const state = dcgState(username, chat);
   if (state === 'removed') return 'failed';
-  if (state === 'joining' || !chat.isEncrypted) return 'wait';
+  if (state === 'joining') return 'joining';
+  if (!chat.isEncrypted) return 'wait';
+  // Someone added the user directly: writing in it is accepting it, as in the app.
+  if (chat.isContactRequest) await dc.rpc.acceptChat(acc.accountId, chatId).catch(() => {});
 
   await dc.rpc.startIo(acc.accountId).catch(() => {});
   ioSendLinger(acc.accountId);
@@ -1558,7 +1576,8 @@ async function flushDcGroupSends(username, chatId) {
       const item = store.getDcGroupSends(key).find((p) => !p.failed);
       if (!item) break;
       const outcome = await sendDcGroupItem(username, chatId, item);
-      if (outcome === 'wait') break;
+      _dcgLastOutcome.set(key, outcome);
+      if (outcome === 'wait' || outcome === 'joining') break;
       if (outcome === 'sent') store.setDcGroupSends(key, store.getDcGroupSends(key).filter((p) => p.localId !== item.localId));
       else markDcGroupItemFailed(username, chatId, item.localId);
     }
@@ -1579,6 +1598,8 @@ function scheduleDcGroupFlush(username, chatId) {
   const tick = async () => {
     await flushDcGroupSends(username, chatId).catch(() => {});
     const left = store.getDcGroupSends(key).filter((p) => !p.failed);
+    // Waiting for the group owner is not failing: keep checking each minute while the join is open.
+    if (left.length && _dcgLastOutcome.get(key) === 'joining' && isJoinPending(username, chatId)) return arm(60_000);
     if (left.length && attempt < DCG_SEND_ATTEMPTS) return arm(Math.min(4_000 * 1.4 ** attempt++, 30_000));
     _dcgRetryTimers.delete(key);
     if (left.length) {
@@ -1620,8 +1641,10 @@ dc.on('ChatModified', (contextId, e) => dcgRefreshSoon(contextId, e.chatId));
 app.post('/dc-groups/:username/join', async (req, res) => {
   const { username } = req.params;
   const invite = String(req.body?.invite || '').trim();
+  if (!USERNAME_RE.test(username) || username === '__bot__') return res.status(404).json({ error: 'Account not found' });
+  await ensureUserAccount(username).catch(() => null);
   const acc = dcgAccount(username);
-  if (!acc) return res.status(404).json({ error: 'Account not found' });
+  if (!acc) return res.status(503).json({ error: 'Chat is starting up. Try again in a minute.' });
   if (!invite || invite.length > 2000) return res.status(400).json({ error: 'Paste a Delta Chat group invite link.' });
   try {
     const qr = await withTimeout(dc.rpc.checkQr(acc.accountId, invite), 10_000, 'dcg/checkQr').catch(() => null);
@@ -1650,8 +1673,9 @@ app.get('/dc-groups/:username', async (req, res) => {
     dc.rpc.startIo(acc.accountId).catch(() => {});
     ioSendLinger(acc.accountId);
     const entries = await withTimeout(dc.rpc.getChatlistEntries(acc.accountId, null, null, null), 8_000, 'dcg/list');
-    const items = Object.values(await withTimeout(dc.rpc.getChatlistItemsByEntries(acc.accountId, entries), 8_000, 'dcg/items'))
+    let items = Object.values(await withTimeout(dc.rpc.getChatlistItemsByEntries(acc.accountId, entries), 8_000, 'dcg/items'))
       .filter((it) => it.kind === 'ChatListItem' && it.chatType === 'Group');
+    for (const it of items) if (isJoinPending(username, it.id)) await settleJoin(username, acc.accountId, it.id).catch(() => {});
     const groups = await Promise.all(items.map(async (it) => {
       const last = it.lastMessageId ? await dc.getMessage(acc.accountId, it.lastMessageId).catch(() => null) : null;
       const lastMessage = last && isShownMessage(last)
@@ -1673,6 +1697,7 @@ app.get('/dc-groups/:username/:chatId/messages', async (req, res) => {
   const acc = dcgAccount(username);
   if (!acc || !chatId) return res.status(404).json({ error: 'Group not found' });
   try {
+    await settleJoin(username, acc.accountId, chatId).catch(() => {});
     const chat = await dcgChat(acc.accountId, chatId);
     if (!chat) return res.status(404).json({ error: 'Group not found' });
     dc.rpc.startIo(acc.accountId).catch(() => {});
